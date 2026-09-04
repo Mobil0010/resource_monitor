@@ -1,11 +1,12 @@
 use std::collections::VecDeque;
-use std::process::{Child, Command, Stdio};
+use std::process::Command;
+use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::time::{Duration, Instant};
 
 use eframe::egui::{
     self, Align, Align2, Color32, FontId, Layout, Margin, RichText, Sense, Stroke, StrokeKind, Vec2,
 };
-use sysinfo::{Disks, Networks, System};
+use sysinfo::{Disks, Networks, ProcessesToUpdate, System};
 
 const BLUE: Color32 = Color32::from_rgb(92, 145, 255);
 const GREEN: Color32 = Color32::from_rgb(68, 196, 130);
@@ -66,13 +67,6 @@ impl Language {
             Self::Japanese => "日本語",
         }
     }
-    fn code(self) -> u8 {
-        match self {
-            Self::English => 0,
-            Self::Korean => 1,
-            Self::Japanese => 2,
-        }
-    }
     fn from_code(code: u8) -> Self {
         match code {
             1 => Self::Korean,
@@ -111,12 +105,6 @@ impl PopupPosition {
             Self::BottomRight => "bottom_right",
         }
     }
-    fn code(self) -> u8 {
-        Self::ALL
-            .iter()
-            .position(|position| *position == self)
-            .unwrap_or(2) as u8
-    }
     fn from_code(code: u8) -> Self {
         Self::ALL
             .get(code as usize)
@@ -130,33 +118,64 @@ struct GpuInfo {
     detail: String,
     usage: f32,
     memory: u64,
+    details_rx: Option<Receiver<String>>,
+    usage_rx: Option<Receiver<String>>,
 }
 
 impl GpuInfo {
     fn new() -> Self {
-        let text = gpu_command_output(true);
-        let name = extract_after(&text, "Chipset Model:")
-            .or_else(|| extract_after(&text, "Name="))
-            .unwrap_or_else(|| "GPU".into());
-        let detail = extract_after(&text, "Total Number of Cores:")
-            .map(|cores| format!("{cores} cores"))
-            .unwrap_or_else(|| platform().into());
+        let (sender, receiver) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = sender.send(gpu_command_output(true));
+        });
         Self {
-            name,
-            detail,
+            name: "GPU".into(),
+            detail: platform().into(),
             usage: 0.0,
             memory: 0,
+            details_rx: Some(receiver),
+            usage_rx: None,
         }
     }
     fn refresh(&mut self) {
-        let text = gpu_command_output(false);
-        self.usage = extract_number(&text, "Device Utilization %")
-            .or_else(|| extract_number(&text, "GPU_USAGE"))
-            .unwrap_or(self.usage)
-            .clamp(0.0, 100.0);
-        self.memory = extract_number(&text, "Alloc system memory")
-            .map(|value| value as u64)
-            .unwrap_or(self.memory);
+        if let Some(receiver) = &self.details_rx {
+            match receiver.try_recv() {
+                Ok(text) => {
+                    self.name = extract_after(&text, "Chipset Model:")
+                        .or_else(|| extract_after(&text, "Name="))
+                        .unwrap_or_else(|| "GPU".into());
+                    self.detail = extract_after(&text, "Total Number of Cores:")
+                        .map(|cores| format!("{cores} cores"))
+                        .unwrap_or_else(|| platform().into());
+                    self.details_rx = None;
+                }
+                Err(TryRecvError::Disconnected) => self.details_rx = None,
+                Err(TryRecvError::Empty) => {}
+            }
+        }
+        if let Some(receiver) = &self.usage_rx {
+            match receiver.try_recv() {
+                Ok(text) => {
+                    self.usage = extract_number(&text, "Device Utilization %")
+                        .or_else(|| extract_number(&text, "GPU_USAGE"))
+                        .unwrap_or(self.usage)
+                        .clamp(0.0, 100.0);
+                    self.memory = extract_number(&text, "Alloc system memory")
+                        .map(|value| value as u64)
+                        .unwrap_or(self.memory);
+                    self.usage_rx = None;
+                }
+                Err(TryRecvError::Disconnected) => self.usage_rx = None,
+                Err(TryRecvError::Empty) => {}
+            }
+        }
+        if self.usage_rx.is_none() {
+            let (sender, receiver) = mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = sender.send(gpu_command_output(false));
+            });
+            self.usage_rx = Some(receiver);
+        }
     }
 }
 
@@ -216,6 +235,8 @@ struct App {
     memory: VecDeque<f32>,
     down: VecDeque<f32>,
     up: VecDeque<f32>,
+    disk_history: VecDeque<f32>,
+    process_history: VecDeque<f32>,
     search: String,
     dark: bool,
     popup: bool,
@@ -229,11 +250,10 @@ struct App {
     popup_opacity: f32,
     language: Language,
     popup_graphs: bool,
-    popup_child: Option<Child>,
-    popup_signature: String,
     confirm_exit: bool,
     autostart: bool,
     settings_message: Option<String>,
+    refresh_secs: u64,
 }
 
 impl App {
@@ -247,7 +267,7 @@ impl App {
         );
         set_style(&cc.egui_ctx, dark);
         let mut app = Self {
-            sys: System::new_all(),
+            sys: System::new(),
             gpu: GpuInfo::new(),
             disks: Disks::new_with_refreshed_list(),
             networks: Networks::new_with_refreshed_list(),
@@ -258,6 +278,8 @@ impl App {
             memory: VecDeque::new(),
             down: VecDeque::new(),
             up: VecDeque::new(),
+            disk_history: VecDeque::new(),
+            process_history: VecDeque::new(),
             search: String::new(),
             dark,
             popup: false,
@@ -271,21 +293,33 @@ impl App {
             popup_opacity: 0.92,
             language: Language::English,
             popup_graphs: true,
-            popup_child: None,
-            popup_signature: String::new(),
             confirm_exit: false,
             autostart: autostart_enabled(),
             settings_message: None,
+            refresh_secs: 2,
         };
         app.refresh();
         app
     }
 
     fn refresh(&mut self) {
-        self.sys.refresh_all();
-        self.gpu.refresh();
-        self.disks.refresh(true);
-        self.networks.refresh(true);
+        self.sys.refresh_cpu_usage();
+        self.sys.refresh_memory();
+        let popup_visible = self.popup;
+        if self.page == Page::Processes || (popup_visible && self.popup_processes) {
+            self.sys.refresh_processes(ProcessesToUpdate::All, true);
+        }
+        if matches!(self.page, Page::Overview | Page::Gpu) || (popup_visible && self.popup_gpu) {
+            self.gpu.refresh();
+        }
+        if matches!(self.page, Page::Overview | Page::Disks) || (popup_visible && self.popup_disk) {
+            self.disks.refresh(true);
+        }
+        if matches!(self.page, Page::Overview | Page::Network)
+            || (popup_visible && self.popup_network)
+        {
+            self.networks.refresh(true);
+        }
         let cpu = self.sys.global_cpu_usage();
         let mem = pct(self.sys.used_memory(), self.sys.total_memory());
         let down = self.networks.iter().map(|(_, n)| n.received()).sum::<u64>() as f32;
@@ -299,6 +333,17 @@ impl App {
         push(&mut self.memory, mem);
         push(&mut self.down, down);
         push(&mut self.up, up);
+        let disk_total: u64 = self.disks.iter().map(|disk| disk.total_space()).sum();
+        let disk_used: u64 = self
+            .disks
+            .iter()
+            .map(|disk| disk.total_space().saturating_sub(disk.available_space()))
+            .sum();
+        push(&mut self.disk_history, pct(disk_used, disk_total));
+        push(
+            &mut self.process_history,
+            self.sys.processes().len().min(100) as f32,
+        );
         self.last = Instant::now();
     }
 
@@ -796,6 +841,19 @@ impl App {
         });
         ui.add_space(12.0);
         card(ui, |ui| {
+            ui.label(
+                RichText::new(tr(lang, "refresh_interval"))
+                    .strong()
+                    .size(15.0),
+            );
+            ui.add_space(6.0);
+            ui.add(
+                egui::Slider::new(&mut self.refresh_secs, 1..=10)
+                    .suffix(tr(lang, "seconds_suffix")),
+            );
+        });
+        ui.add_space(12.0);
+        card(ui, |ui| {
             ui.label(RichText::new(tr(lang, "startup")).strong().size(15.0));
             let mut enabled = self.autostart;
             if ui
@@ -820,69 +878,7 @@ impl App {
         });
     }
 
-    fn sync_popup_process(&mut self) {
-        if let Some(child) = self.popup_child.as_mut()
-            && child.try_wait().ok().flatten().is_some()
-        {
-            self.popup_child = None;
-            self.popup = false;
-        }
-        if !self.popup {
-            if let Some(mut child) = self.popup_child.take() {
-                let _ = child.kill();
-            }
-            self.popup_signature.clear();
-            return;
-        }
-        let flags = format!(
-            "{}{}{}{}{}{}{}",
-            self.popup_cpu as u8,
-            self.popup_gpu as u8,
-            self.popup_memory as u8,
-            self.popup_disk as u8,
-            self.popup_processes as u8,
-            self.popup_network as u8,
-            self.popup_graphs as u8
-        );
-        let signature = format!(
-            "{:.2}:{}:{}:{}:{}",
-            self.popup_opacity,
-            self.popup_position.code(),
-            flags,
-            self.language.code(),
-            self.dark as u8
-        );
-        if self.popup_child.is_some() {
-            if self.popup_signature != signature {
-                let _ = std::fs::write(popup_config_file(), &signature);
-                self.popup_signature = signature;
-            }
-            return;
-        }
-        let _ = std::fs::remove_file(shutdown_file());
-        let _ = std::fs::write(popup_config_file(), &signature);
-        let child = std::env::current_exe().ok().and_then(|exe| {
-            Command::new(exe)
-                .args([
-                    "--popup",
-                    &format!("{:.2}", self.popup_opacity),
-                    &self.popup_position.code().to_string(),
-                    &flags,
-                    &self.language.code().to_string(),
-                    &(self.dark as u8).to_string(),
-                ])
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-                .ok()
-        });
-        self.popup_child = child;
-        self.popup_signature = signature;
-    }
-
-    #[allow(dead_code)]
-    fn show_popup_legacy(&mut self, ctx: &egui::Context) {
+    fn show_popup(&mut self, ctx: &egui::Context) {
         if !self.popup {
             return;
         }
@@ -890,18 +886,21 @@ impl App {
             .input(|i| i.viewport().monitor_size)
             .unwrap_or(Vec2::new(1920.0, 1080.0));
         let width = 292.0;
-        let count = [
+        let shown = [
             self.popup_cpu,
+            self.popup_gpu,
             self.popup_memory,
             self.popup_disk,
             self.popup_processes,
             self.popup_network,
-        ]
-        .into_iter()
-        .filter(|shown| *shown)
-        .count()
-        .max(1);
-        let height = 48.0 + count as f32 * 31.0;
+        ];
+        let count = shown.into_iter().filter(|shown| *shown).count().max(1);
+        let graph_rows = if self.popup_graphs {
+            (count + 1) / 2
+        } else {
+            0
+        };
+        let height = 48.0 + count as f32 * 31.0 + graph_rows as f32 * 76.0;
         let margin = 18.0;
         let top = if cfg!(target_os = "macos") {
             42.0
@@ -931,27 +930,32 @@ impl App {
             .iter()
             .map(|d| d.total_space().saturating_sub(d.available_space()))
             .sum();
-        let values = (
+        let values = [
             self.sys.global_cpu_usage(),
+            self.gpu.usage,
             pct(self.sys.used_memory(), self.sys.total_memory()),
             pct(disk_used, disk_total),
-            self.sys.processes().len(),
-            self.networks.iter().map(|(_, n)| n.received()).sum::<u64>(),
-            self.networks
-                .iter()
-                .map(|(_, n)| n.transmitted())
-                .sum::<u64>(),
-        );
-        let shown = (
-            self.popup_cpu,
-            self.popup_memory,
-            self.popup_disk,
-            self.popup_processes,
-            self.popup_network,
-        );
+            self.sys.processes().len() as f32,
+            0.0,
+        ];
+        let network_down = self.networks.iter().map(|(_, n)| n.received()).sum::<u64>();
+        let network_up = self
+            .networks
+            .iter()
+            .map(|(_, n)| n.transmitted())
+            .sum::<u64>();
+        let histories = [
+            &self.cpu,
+            &self.gpu_history,
+            &self.memory,
+            &self.disk_history,
+            &self.process_history,
+            &self.down,
+        ];
         let dark = self.dark;
         let opacity = self.popup_opacity;
         let lang = self.language;
+        let graphs = self.popup_graphs;
         let builder = egui::ViewportBuilder::default()
             .with_title("Resource Monitor Popup")
             .with_inner_size([width, height])
@@ -988,25 +992,43 @@ impl App {
                             });
                         });
                         ui.separator();
-                        if shown.0 {
-                            popup_row(ui, "CPU", &format!("{:.1}%", values.0), BLUE);
+                        let labels = [
+                            "CPU",
+                            "GPU",
+                            tr(lang, "memory"),
+                            tr(lang, "disk"),
+                            tr(lang, "processes"),
+                            tr(lang, "network"),
+                        ];
+                        let colors = [BLUE, GREEN, PURPLE, ORANGE, GREEN, GREEN];
+                        for index in 0..6 {
+                            if shown[index] {
+                                let value = if index < 4 {
+                                    format!("{:.1}%", values[index])
+                                } else if index == 4 {
+                                    format!("{:.0}", values[index])
+                                } else {
+                                    format!("↓ {}  ↑ {}", rate(network_down), rate(network_up))
+                                };
+                                popup_row(ui, labels[index], &value, colors[index]);
+                            }
                         }
-                        if shown.1 {
-                            popup_row(ui, tr(lang, "memory"), &format!("{:.1}%", values.1), PURPLE);
-                        }
-                        if shown.2 {
-                            popup_row(ui, tr(lang, "disk"), &format!("{:.1}%", values.2), ORANGE);
-                        }
-                        if shown.3 {
-                            popup_row(ui, tr(lang, "processes"), &values.3.to_string(), GREEN);
-                        }
-                        if shown.4 {
-                            popup_row(
-                                ui,
-                                tr(lang, "network"),
-                                &format!("↓ {}  ↑ {}", rate(values.4), rate(values.5)),
-                                GREEN,
-                            );
+                        if graphs {
+                            ui.add_space(6.0);
+                            let indices: Vec<_> = (0..6).filter(|index| shown[*index]).collect();
+                            for pair in indices.chunks(2) {
+                                ui.columns(2, |columns| {
+                                    for (column, index) in pair.iter().enumerate() {
+                                        mini_chart(
+                                            &mut columns[column],
+                                            labels[*index],
+                                            histories[*index],
+                                            colors[*index],
+                                        );
+                                    }
+                                });
+                                ui.add_space(5.0);
+                            }
                         }
                     });
                 ui.ctx().input(|i| i.viewport().close_requested())
@@ -1021,9 +1043,26 @@ impl App {
 impl eframe::App for App {
     fn ui(&mut self, root: &mut egui::Ui, _: &mut eframe::Frame) {
         let ctx = root.ctx().clone();
-        if self.last.elapsed() >= Duration::from_secs(1) {
+        if self.popup && ctx.input(|input| input.viewport().close_requested()) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+        }
+        if self.last.elapsed() >= Duration::from_secs(self.refresh_secs) {
             self.refresh();
         }
+        #[cfg(target_os = "macos")]
+        egui::Panel::top("mac_titlebar")
+            .exact_size(28.0)
+            .frame(
+                egui::Frame::new()
+                    .fill(if self.dark {
+                        Color32::from_rgb(45, 44, 43)
+                    } else {
+                        Color32::from_rgb(235, 233, 231)
+                    })
+                    .inner_margin(Margin::ZERO),
+            )
+            .show(root, |_| {});
         self.sidebar(root);
         egui::Panel::top("top")
             .exact_size(67.0)
@@ -1059,7 +1098,7 @@ impl eframe::App for App {
                             set_style(&ctx, self.dark);
                         }
                         ui.label(
-                            RichText::new(tr(self.language, "refresh_second"))
+                            RichText::new(refresh_label(self.language, self.refresh_secs))
                                 .weak()
                                 .size(12.0),
                         );
@@ -1086,7 +1125,7 @@ impl eframe::App for App {
                         Page::Settings => self.settings_page(ui),
                     });
             });
-        self.sync_popup_process();
+        self.show_popup(&ctx);
         if self.confirm_exit {
             let mut answer = None;
             egui::Modal::new(egui::Id::new("exit_confirmation")).show(&ctx, |ui| {
@@ -1104,23 +1143,19 @@ impl eframe::App for App {
             });
             match answer {
                 Some(true) => {
-                    let _ = std::fs::write(shutdown_file(), b"quit");
-                    if let Some(mut child) = self.popup_child.take() {
-                        let _ = child.kill();
-                    }
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 }
                 Some(false) => self.confirm_exit = false,
                 None => {}
             }
         }
-        ctx.request_repaint_after(Duration::from_millis(250));
+        ctx.request_repaint_after(
+            Duration::from_secs(self.refresh_secs).saturating_sub(self.last.elapsed()),
+        );
     }
 
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
-        // Child viewports marked as transparent must also clear their GPU surface
-        // with a zero-alpha color, otherwise the compositor shows a black backdrop.
-        background(self.dark).to_normalized_gamma_f32()
+        Color32::TRANSPARENT.to_normalized_gamma_f32()
     }
 }
 
@@ -1132,6 +1167,7 @@ struct PopupConfig {
     graphs: bool,
     language: Language,
     dark: bool,
+    refresh_secs: u64,
 }
 
 impl PopupConfig {
@@ -1151,6 +1187,11 @@ impl PopupConfig {
             graphs: flags.as_bytes().get(6) == Some(&b'1'),
             language: Language::from_code(parts.next()?.parse().ok()?),
             dark: parts.next()?.parse::<u8>().ok()? != 0,
+            refresh_secs: parts
+                .next()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(2)
+                .clamp(1, 10),
         })
     }
 
@@ -1169,6 +1210,9 @@ struct PopupApp {
     networks: Networks,
     last: Instant,
     histories: [VecDeque<f32>; 6],
+    config_text: String,
+    last_config_check: Instant,
+    layout_dirty: bool,
 }
 
 impl PopupApp {
@@ -1183,6 +1227,9 @@ impl PopupApp {
             networks: Networks::new_with_refreshed_list(),
             last: Instant::now() - Duration::from_secs(2),
             histories: std::array::from_fn(|_| VecDeque::new()),
+            config_text: String::new(),
+            last_config_check: Instant::now() - Duration::from_secs(1),
+            layout_dirty: true,
         };
         app.refresh();
         app
@@ -1207,7 +1254,9 @@ impl PopupApp {
         ]
     }
     fn refresh(&mut self) {
-        self.sys.refresh_all();
+        self.sys.refresh_cpu_usage();
+        self.sys.refresh_memory();
+        self.sys.refresh_processes(ProcessesToUpdate::All, true);
         self.gpu.refresh();
         self.disks.refresh(true);
         self.networks.refresh(true);
@@ -1226,27 +1275,27 @@ impl eframe::App for PopupApp {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             return;
         }
-        if let Ok(value) = std::fs::read_to_string(popup_config_file())
-            && let Some(config) = PopupConfig::parse(&value)
-        {
-            if config.dark != self.config.dark {
-                set_style(&ctx, config.dark);
+        if self.last_config_check.elapsed() >= Duration::from_millis(100) {
+            self.last_config_check = Instant::now();
+            if let Ok(value) = std::fs::read_to_string(popup_config_file())
+                && value != self.config_text
+                && let Some(config) = PopupConfig::parse(&value)
+            {
+                if config.dark != self.config.dark {
+                    set_style(&ctx, config.dark);
+                }
+                self.config = config;
+                self.config_text = value;
+                self.layout_dirty = true;
             }
-            self.config = config;
         }
-        if self.last.elapsed() >= Duration::from_secs(1) {
+        if self.last.elapsed() >= Duration::from_secs(self.config.refresh_secs) {
             self.refresh();
         }
-        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(Vec2::new(
-            292.0,
-            self.config.window_height(),
-        )));
         let monitor = ctx
             .input(|i| i.viewport().monitor_size)
             .unwrap_or(Vec2::new(1920.0, 1080.0));
-        let size = ctx
-            .input(|i| i.viewport().inner_rect.map(|r| r.size()))
-            .unwrap_or(Vec2::new(292.0, 180.0));
+        let size = Vec2::new(292.0, self.config.window_height());
         let margin = 18.0;
         let center = (monitor.x - size.x) / 2.0;
         let right = monitor.x - size.x - margin;
@@ -1270,7 +1319,14 @@ impl eframe::App for PopupApp {
             PopupPosition::BottomCenter => [center, bottom],
             PopupPosition::BottomRight => [right, bottom],
         };
-        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos.into()));
+        if self.layout_dirty {
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(Vec2::new(
+                292.0,
+                self.config.window_height(),
+            )));
+            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos.into()));
+            self.layout_dirty = false;
+        }
         let values = self.values();
         let network_down = self.networks.iter().map(|(_, n)| n.received()).sum::<u64>();
         let network_up = self
@@ -1337,7 +1393,7 @@ impl eframe::App for PopupApp {
                     }
                 }
             });
-        ctx.request_repaint_after(Duration::from_millis(50));
+        ctx.request_repaint_after(Duration::from_millis(100));
     }
     fn clear_color(&self, _: &egui::Visuals) -> [f32; 4] {
         Color32::TRANSPARENT.to_normalized_gamma_f32()
@@ -1445,10 +1501,10 @@ fn set_autostart(enabled: bool) -> Result<(), String> {
         return status
             .success()
             .then_some(())
-            .ok_or("시작 프로그램 설정에 실패했어.".into());
+            .ok_or("시작 프로그램 설정에 실패했습니다.".into());
     }
     #[allow(unreachable_code)]
-    Err("이 운영체제에서는 자동 실행을 지원하지 않아.".into())
+    Err("이 운영체제에서는 자동 실행을 지원하지 않습니다.".into())
 }
 
 fn set_style(ctx: &egui::Context, dark: bool) {
@@ -1853,9 +1909,11 @@ fn tr<'a>(lang: Language, key: &'a str) -> &'a str {
         (Language::Japanese, "settings") => "設定",
         (Language::Korean, "language") => "언어",
         (Language::Japanese, "language") => "言語",
-        (Language::Korean, "popup_title") => "항상 위에 표시할 팝업",
-        (Language::Japanese, "popup_title") => "常に手前に表示するポップアップ",
-        (Language::Korean, "popup_description") => "선택한 시스템 정보를 작은 창으로 계속 표시해.",
+        (Language::Korean, "popup_title") => "팝업 설정",
+        (Language::Japanese, "popup_title") => "ポップアップ設定",
+        (Language::Korean, "popup_description") => {
+            "선택한 시스템 정보를 작은 창으로 계속 표시합니다."
+        }
         (Language::Japanese, "popup_description") => {
             "選択したシステム情報を小さなウィンドウに表示します。"
         }
@@ -1949,6 +2007,10 @@ fn tr<'a>(lang: Language, key: &'a str) -> &'a str {
         (Language::Japanese, "upload_last_60") => "アップロード — 過去60秒",
         (Language::Korean, "popup_graphs") => "미니 그래프",
         (Language::Japanese, "popup_graphs") => "ミニグラフ",
+        (Language::Korean, "refresh_interval") => "새로고침 간격",
+        (Language::Japanese, "refresh_interval") => "更新間隔",
+        (Language::Korean, "seconds_suffix") => "초",
+        (Language::Japanese, "seconds_suffix") => "秒",
         (Language::Korean, "gpu_usage") => "GPU 사용률",
         (Language::Japanese, "gpu_usage") => "GPU 使用率",
         (Language::Korean, "graphics_processor") => "그래픽 프로세서",
@@ -1965,9 +2027,9 @@ fn tr<'a>(lang: Language, key: &'a str) -> &'a str {
         (Language::Japanese, "startup_enable") => "起動時に自動実行",
         (Language::Korean, "quit_app") => "프로그램 종료",
         (Language::Japanese, "quit_app") => "アプリを終了",
-        (Language::Korean, "quit_title") => "완전히 종료할까?",
+        (Language::Korean, "quit_title") => "완전히 종료하시겠습니까?",
         (Language::Japanese, "quit_title") => "完全に終了しますか？",
-        (Language::Korean, "quit_question") => "메인 창과 팝업을 모두 종료해.",
+        (Language::Korean, "quit_question") => "메인 창과 팝업을 모두 종료합니다.",
         (Language::Japanese, "quit_question") => "メイン画面とポップアップを終了します。",
         (Language::Korean, "yes") => "예",
         (Language::Japanese, "yes") => "はい",
@@ -1982,7 +2044,7 @@ fn tr<'a>(lang: Language, key: &'a str) -> &'a str {
         (_, "network") => "Network",
         (_, "settings") => "Settings",
         (_, "language") => "Language",
-        (_, "popup_title") => "Always-on-top popup",
+        (_, "popup_title") => "Popup settings",
         (_, "popup_description") => "Keep selected system information visible in a small window.",
         (_, "popup_enable") => "Enable popup",
         (_, "visible_items") => "Visible information",
@@ -2029,6 +2091,8 @@ fn tr<'a>(lang: Language, key: &'a str) -> &'a str {
         (_, "download_last_60") => "Download — last 60 seconds",
         (_, "upload_last_60") => "Upload — last 60 seconds",
         (_, "popup_graphs") => "Mini graphs",
+        (_, "refresh_interval") => "Refresh interval",
+        (_, "seconds_suffix") => " seconds",
         (_, "gpu") => "GPU",
         (_, "gpu_usage") => "GPU usage",
         (_, "graphics_processor") => "Graphics processor",
@@ -2046,6 +2110,14 @@ fn tr<'a>(lang: Language, key: &'a str) -> &'a str {
     }
 }
 
+fn refresh_label(language: Language, seconds: u64) -> String {
+    match language {
+        Language::English => format!("Refreshes every {seconds} seconds"),
+        Language::Korean => format!("{seconds}초마다 새로고침"),
+        Language::Japanese => format!("{seconds}秒ごとに更新"),
+    }
+}
+
 fn main() -> eframe::Result {
     let args: Vec<String> = std::env::args().collect();
     if args.get(1).is_some_and(|arg| arg == "--popup") {
@@ -2060,6 +2132,11 @@ fn main() -> eframe::Result {
         let graphs = flags.as_bytes().get(6) == Some(&b'1');
         let language = Language::from_code(args.get(5).and_then(|v| v.parse().ok()).unwrap_or(0));
         let dark = args.get(6).and_then(|v| v.parse::<u8>().ok()).unwrap_or(1) != 0;
+        let refresh_secs = args
+            .get(7)
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(2)
+            .clamp(1, 10);
         let count = shown.into_iter().filter(|v| *v).count().max(1);
         let rows = if graphs { (count + 1) / 2 } else { 0 };
         let height = 48.0 + count as f32 * 31.0 + rows as f32 * 76.0;
@@ -2070,6 +2147,7 @@ fn main() -> eframe::Result {
             graphs,
             language,
             dark,
+            refresh_secs,
         };
         let options = eframe::NativeOptions {
             viewport: egui::ViewportBuilder::default()
@@ -2087,16 +2165,21 @@ fn main() -> eframe::Result {
             Box::new(move |cc| Ok(Box::new(PopupApp::new(cc, config)))),
         );
     }
+    let viewport = egui::ViewportBuilder::default()
+        .with_title("Resource Monitor")
+        .with_inner_size([1180.0, 760.0])
+        .with_min_inner_size([900.0, 620.0])
+        .with_transparent(true);
+    #[cfg(target_os = "macos")]
+    let viewport = viewport
+        .with_fullsize_content_view(true)
+        .with_titlebar_shown(false)
+        .with_title_shown(true)
+        .with_titlebar_buttons_shown(true);
+    #[cfg(not(target_os = "macos"))]
+    let viewport = viewport.with_titlebar_shown(true);
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title("Resource Monitor")
-            .with_inner_size([1180.0, 760.0])
-            .with_min_inner_size([900.0, 620.0])
-            .with_transparent(false)
-            .with_fullsize_content_view(false)
-            .with_titlebar_shown(true)
-            .with_title_shown(true)
-            .with_titlebar_buttons_shown(true),
+        viewport,
         centered: true,
         ..Default::default()
     };

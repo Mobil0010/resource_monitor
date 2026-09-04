@@ -1,0 +1,31 @@
+server {
+    listen ${PORT};
+    server_name _;
+    root /usr/share/nginx/html;
+    index index.html;
+
+    location = /healthz {
+        access_log off;
+        add_header Content-Type text/plain;
+        return 200 "ok\n";
+    }
+
+    location = /downloads/latest.json {
+        proxy_ssl_server_name on;
+        proxy_set_header Host storage.googleapis.com;
+        proxy_pass https://storage.googleapis.com/${DOWNLOAD_BUCKET}/latest.json;
+        proxy_hide_header Cache-Control;
+        add_header Cache-Control "no-store, max-age=0";
+    }
+
+    location ~* \.(css|js|svg|png|jpg|jpeg|webp|ico)$ {
+        try_files $uri =404;
+        expires 1h;
+        add_header Cache-Control "public, max-age=3600";
+    }
+
+    location / {
+        try_files $uri $uri/ /index.html;
+        add_header Cache-Control "no-cache";
+    }
+}

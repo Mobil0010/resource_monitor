@@ -1,0 +1,129 @@
+name: Build and publish packages to GCP
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  macos:
+    runs-on: macos-14
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Determine version
+        id: version
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+            echo "value=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          else
+            echo "value=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Build universal DMG
+        run: bash scripts/package-macos.sh "${{ steps.version.outputs.value }}"
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v3
+        with:
+          project_id: ${{ vars.GCP_PROJECT_ID }}
+          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
+      - name: Set up Google Cloud CLI
+        uses: google-github-actions/setup-gcloud@v3
+      - name: Upload macOS package to Cloud Storage
+        shell: bash
+        run: |
+          gcloud storage cp dist/*.dmg \
+            "gs://${{ vars.GCP_DOWNLOAD_BUCKET }}/releases/v${{ steps.version.outputs.value }}/" \
+            --cache-control="public,max-age=31536000,immutable"
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - name: Determine version
+        id: version
+        shell: pwsh
+        run: |
+          if ($env:GITHUB_REF_TYPE -eq "tag") {
+            "value=$($env:GITHUB_REF_NAME.TrimStart('v'))" >> $env:GITHUB_OUTPUT
+          } else {
+            $version = (Select-String -Path Cargo.toml -Pattern '^version = "([^"]+)"').Matches[0].Groups[1].Value
+            "value=$version" >> $env:GITHUB_OUTPUT
+          }
+      - name: Build Windows executable
+        run: cargo build --release --target x86_64-pc-windows-msvc
+      - name: Build portable ZIP
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist\portable\ResourceMonitor | Out-Null
+          Copy-Item target\x86_64-pc-windows-msvc\release\resource_monitor.exe dist\portable\ResourceMonitor\ResourceMonitor.exe
+          Copy-Item README.md dist\portable\ResourceMonitor\README.md
+          Compress-Archive -Path dist\portable\ResourceMonitor -DestinationPath "dist\ResourceMonitor-${{ steps.version.outputs.value }}-Windows-Portable.zip"
+      - name: Build Windows installer
+        shell: pwsh
+        run: |
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" "/DAppVersion=${{ steps.version.outputs.value }}" "/DSourceExe=$pwd\target\x86_64-pc-windows-msvc\release\resource_monitor.exe" packaging\windows\resource-monitor.iss
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v3
+        with:
+          project_id: ${{ vars.GCP_PROJECT_ID }}
+          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
+      - name: Set up Google Cloud CLI
+        uses: google-github-actions/setup-gcloud@v3
+      - name: Upload Windows packages to Cloud Storage
+        shell: pwsh
+        run: |
+          gcloud storage cp dist\*-Windows-Setup.exe dist\*-Windows-Portable.zip "gs://${{ vars.GCP_DOWNLOAD_BUCKET }}/releases/v${{ steps.version.outputs.value }}/" --cache-control="public,max-age=31536000,immutable"
+
+  manifest:
+    needs: [macos, windows]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Determine version
+        id: version
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+            echo "value=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          else
+            echo "value=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v3
+        with:
+          project_id: ${{ vars.GCP_PROJECT_ID }}
+          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
+      - name: Set up Google Cloud CLI
+        uses: google-github-actions/setup-gcloud@v3
+      - name: Publish latest version manifest
+        shell: bash
+        run: |
+          version="${{ steps.version.outputs.value }}"
+          bucket="${{ vars.GCP_DOWNLOAD_BUCKET }}"
+          base="https://storage.googleapis.com/${bucket}/releases/v${version}"
+          jq -n \
+            --arg version "v${version}" \
+            --arg published_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --arg macos "${base}/ResourceMonitor-${version}-macOS-Universal.dmg" \
+            --arg windows_installer "${base}/ResourceMonitor-${version}-Windows-Setup.exe" \
+            --arg windows_portable "${base}/ResourceMonitor-${version}-Windows-Portable.zip" \
+            '{version: $version, published_at: $published_at, files: {macos: $macos, windows_installer: $windows_installer, windows_portable: $windows_portable}}' \
+            > latest.json
+          gcloud storage cp latest.json "gs://${bucket}/latest.json" --cache-control="no-store,max-age=0"
