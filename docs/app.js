@@ -1,6 +1,6 @@
 const body = document.body;
 const repoOverride = body.dataset.repository.trim();
-const manifestUrl = body.dataset.manifestUrl || "/downloads/latest.json";
+const releaseApiUrl = `https://api.github.com/repos/${repoOverride}/releases/latest`;
 
 function detectPlatform() {
   const override = new URLSearchParams(location.search).get("platform");
@@ -64,40 +64,57 @@ menuButton.addEventListener("click", () => {
   menuButton.setAttribute("aria-expanded", String(open));
 });
 
-function showUnavailable(message) {
+const releasesUrl = `${githubUrl}/releases/latest`;
+
+function useReleasePage(message) {
   [primary, portable, macDownload, windowsDownload, windowsPortableDownload].forEach((link) => {
-    link.href = "#";
-    link.setAttribute("aria-disabled", "true");
+    link.href = releasesUrl;
+    link.removeAttribute("aria-disabled");
   });
+  primaryText.textContent = "GitHub에서 설치 파일 보기";
   releaseNote.textContent = message;
 }
 
 async function loadLatestRelease() {
-  showUnavailable("GCP Cloud Storage에서 최신 설치 파일을 확인하고 있습니다.");
+  useReleasePage("GitHub Releases에서 최신 설치 파일을 확인하고 있습니다.");
 
   try {
-    const response = await fetch(manifestUrl, { cache: "no-store" });
-    if (!response.ok) throw new Error("manifest unavailable");
-    const release = await response.json();
-    const files = release.files || {};
-    if (!files.macos || !files.windows_installer || !files.windows_portable) {
-      throw new Error("manifest incomplete");
-    }
-
-    [primary, portable, macDownload, windowsDownload, windowsPortableDownload].forEach((link) => {
-      link.removeAttribute("aria-disabled");
+    const response = await fetch(releaseApiUrl, {
+      headers: { Accept: "application/vnd.github+json" },
+      signal: AbortSignal.timeout(10000),
     });
-    versionLabel.textContent = release.version || "최신 버전";
-    macDownload.href = files.macos;
-    windowsDownload.href = files.windows_installer;
-    windowsPortableDownload.href = files.windows_portable;
-    portable.href = windowsPortableDownload.href;
-    primary.href = platform === "windows" ? windowsDownload.href : macDownload.href;
-    releaseNote.textContent = release.published_at
-      ? `${new Intl.DateTimeFormat("ko-KR", { dateStyle: "long" }).format(new Date(release.published_at))} 릴리스`
-      : "GCP Cloud Storage에서 제공하는 최신 버전입니다.";
+    if (!response.ok) throw new Error("release unavailable");
+    const release = await response.json();
+    if (release.draft || release.prerelease || !Array.isArray(release.assets)) {
+      throw new Error("release invalid");
+    }
+    const assetUrl = (suffix) => {
+      const asset = release.assets.find((item) =>
+        item.name?.startsWith("ResourceMonitor-") && item.name.endsWith(suffix) &&
+        item.browser_download_url?.startsWith(`${githubUrl}/releases/download/`)
+      );
+      return asset?.browser_download_url;
+    };
+    const mac = assetUrl("-macOS-Universal.dmg");
+    const windows = assetUrl("-Windows-Setup.exe");
+    const zip = assetUrl("-Windows-Portable.zip");
+    macDownload.href = mac || releasesUrl;
+    windowsDownload.href = windows || releasesUrl;
+    windowsPortableDownload.href = zip || releasesUrl;
+    portable.href = zip || releasesUrl;
+    const selected = platform === "mac" ? mac : platform === "windows" ? windows : null;
+    primary.href = selected || releasesUrl;
+    primaryText.textContent = selected ? copy.primary : "최신 릴리스 보기";
+    versionLabel.textContent = release.tag_name || "최신 버전";
+    const published = new Date(release.published_at);
+    releaseNote.textContent = release.published_at && !Number.isNaN(published.getTime())
+      ? `${new Intl.DateTimeFormat("ko-KR", { dateStyle: "long" }).format(published)} 릴리스`
+      : "GitHub Releases에서 제공하는 최신 버전입니다.";
+    if (!mac || !windows || !zip) {
+      releaseNote.textContent += " 일부 설치 파일은 릴리스 페이지에서 확인해 주세요.";
+    }
   } catch {
-    showUnavailable("아직 GCP에 게시된 설치 파일이 없습니다.");
+    useReleasePage("최신 버전을 확인하지 못했습니다. GitHub 릴리스 페이지에서 설치 파일을 확인해 주세요.");
   }
 }
 

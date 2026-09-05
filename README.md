@@ -78,7 +78,7 @@ cargo run
 
 ## 배포용 빌드
 
-GitHub에 `v0.1.0`과 같은 버전 태그를 푸시하면 `.github/workflows/release.yml`이 아래 설치 파일을 빌드하여 GCP Cloud Storage에 직접 업로드합니다. GitHub Releases는 사용하지 않습니다.
+GitHub에 `v0.1.0`과 같은 버전 태그를 푸시하면 `.github/workflows/release.yml`이 아래 설치 파일을 빌드하여 GitHub Releases에 게시합니다. 모든 운영체제의 빌드가 성공한 뒤 공개되며, SHA256SUMS.txt 검증 파일도 함께 제공합니다. 태그 버전은 Cargo.toml의 버전과 일치해야 합니다.
 
 - `ResourceMonitor-0.1.0-macOS-Universal.dmg`
 - `ResourceMonitor-0.1.0-Windows-Setup.exe`
@@ -99,19 +99,16 @@ Apple Developer 인증서가 없으면 테스트 가능한 ad-hoc 서명 DMG가 
 
 Windows 설치 마법사와 Portable ZIP은 Windows GitHub Actions 실행 환경에서 Inno Setup으로 생성됩니다.
 
-## GCP 홈페이지 배포
+## 홈페이지 배포
 
-설치 홈페이지는 `Dockerfile`을 사용하여 Google Cloud Run에 배포합니다. 홈페이지는 macOS 접속자에게 Universal DMG를, Windows 접속자에게 설치 마법사와 Portable ZIP을 우선 표시합니다.
+설치 홈페이지는 GitHub Actions를 통해 GitHub Pages에 배포합니다. 홈페이지는 macOS 접속자에게 Universal DMG를, Windows 접속자에게 설치 마법사와 Portable ZIP을 우선 표시합니다. 설치 파일은 GitHub Releases에서 직접 다운로드합니다.
 
-```bash
-gcloud run deploy resource-monitor-site \
-  --source . \
-  --region asia-northeast3 \
-  --set-env-vars DOWNLOAD_BUCKET=YOUR_DOWNLOAD_BUCKET \
-  --allow-unauthenticated
-```
+저장소의 **Settings → Pages → Build and deployment → Source**를 **GitHub Actions**로 설정해 주세요. 이후 main 또는 master 브랜치의 홈페이지 변경 사항이 자동 배포됩니다.
 
-GCP 프로젝트 준비, GitHub Actions 자동 인증 및 사용자 도메인 연결 방법은 [GCP_DEPLOY.md](./GCP_DEPLOY.md)를 확인해 주세요.
+- 홈페이지: https://mobil0010.github.io/resource_monitor/
+- 설치 파일: https://github.com/Mobil0010/resource_monitor/releases/latest
+
+위 홈페이지 주소는 Pages 설정과 첫 배포가 완료된 뒤 사용할 수 있습니다. 자세한 초기 설정과 버전 배포 절차는 [GITHUB_DEPLOY.md](./GITHUB_DEPLOY.md)를 확인해 주세요. GCP 계정이나 인증 키는 필요하지 않습니다.
 
 ## 사용법
 
@@ -133,13 +130,11 @@ GCP 프로젝트 준비, GitHub Actions 자동 인증 및 사용자 도메인 �
 ```text
 resource_monitor/
 ├── .github/workflows/
-│   ├── gcp-site.yml
+│   ├── pages.yml
 │   └── release.yml
 ├── Cargo.toml
 ├── Cargo.lock
-├── Dockerfile
-├── GCP_DEPLOY.md
-├── deploy/nginx.conf.template
+├── GITHUB_DEPLOY.md
 ├── packaging/
 │   ├── macos/Info.plist
 │   └── windows/resource-monitor.iss
@@ -151,6 +146,12 @@ resource_monitor/
 ```
 
 ## 개발 명령어
+
+홈페이지 다운로드 연결 테스트(Node.js 필요):
+
+```bash
+node --test tests/site-downloads.test.mjs
+```
 
 코드 포맷 확인:
 

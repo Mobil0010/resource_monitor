@@ -1,4 +1,4 @@
-name: Build and publish packages to GCP
+name: Build and publish GitHub release
 
 on:
   push:
@@ -8,43 +8,50 @@ on:
 
 permissions:
   contents: read
-  id-token: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.value }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate release tag and package version
+        id: version
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF_TYPE" != "tag" || ! "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Select or push a stable version tag such as v0.1.0."
+            exit 1
+          fi
+          version="${GITHUB_REF_NAME#v}"
+          package_version=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["package"]["version"])')
+          test "$version" = "$package_version" || { echo "::error::Tag must match Cargo.toml version."; exit 1; }
+          echo "value=$version" >> "$GITHUB_OUTPUT"
   macos:
+    needs: prepare
     runs-on: macos-14
     steps:
       - name: Checkout
         uses: actions/checkout@v4
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
-      - name: Determine version
-        id: version
-        shell: bash
-        run: |
-          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
-            echo "value=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
-          else
-            echo "value=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)" >> "$GITHUB_OUTPUT"
-          fi
       - name: Build universal DMG
-        run: bash scripts/package-macos.sh "${{ steps.version.outputs.value }}"
-      - name: Authenticate to Google Cloud
-        uses: google-github-actions/auth@v3
+        run: bash scripts/package-macos.sh "${{ needs.prepare.outputs.version }}"
+      - name: Save macOS packages
+        uses: actions/upload-artifact@v4
         with:
-          project_id: ${{ vars.GCP_PROJECT_ID }}
-          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
-          service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
-      - name: Set up Google Cloud CLI
-        uses: google-github-actions/setup-gcloud@v3
-      - name: Upload macOS package to Cloud Storage
-        shell: bash
-        run: |
-          gcloud storage cp dist/*.dmg \
-            "gs://${{ vars.GCP_DOWNLOAD_BUCKET }}/releases/v${{ steps.version.outputs.value }}/" \
-            --cache-control="public,max-age=31536000,immutable"
+          name: macos-packages
+          path: dist/*.dmg
+          if-no-files-found: error
+          retention-days: 7
 
   windows:
+    needs: prepare
     runs-on: windows-latest
     steps:
       - name: Checkout
@@ -53,16 +60,6 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-pc-windows-msvc
-      - name: Determine version
-        id: version
-        shell: pwsh
-        run: |
-          if ($env:GITHUB_REF_TYPE -eq "tag") {
-            "value=$($env:GITHUB_REF_NAME.TrimStart('v'))" >> $env:GITHUB_OUTPUT
-          } else {
-            $version = (Select-String -Path Cargo.toml -Pattern '^version = "([^"]+)"').Matches[0].Groups[1].Value
-            "value=$version" >> $env:GITHUB_OUTPUT
-          }
       - name: Build Windows executable
         run: cargo build --release --target x86_64-pc-windows-msvc
       - name: Build portable ZIP
@@ -71,59 +68,56 @@ jobs:
           New-Item -ItemType Directory -Force -Path dist\portable\ResourceMonitor | Out-Null
           Copy-Item target\x86_64-pc-windows-msvc\release\resource_monitor.exe dist\portable\ResourceMonitor\ResourceMonitor.exe
           Copy-Item README.md dist\portable\ResourceMonitor\README.md
-          Compress-Archive -Path dist\portable\ResourceMonitor -DestinationPath "dist\ResourceMonitor-${{ steps.version.outputs.value }}-Windows-Portable.zip"
+          Compress-Archive -Path dist\portable\ResourceMonitor -DestinationPath "dist\ResourceMonitor-${{ needs.prepare.outputs.version }}-Windows-Portable.zip"
       - name: Build Windows installer
         shell: pwsh
         run: |
-          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" "/DAppVersion=${{ steps.version.outputs.value }}" "/DSourceExe=$pwd\target\x86_64-pc-windows-msvc\release\resource_monitor.exe" packaging\windows\resource-monitor.iss
-      - name: Authenticate to Google Cloud
-        uses: google-github-actions/auth@v3
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" "/DAppVersion=${{ needs.prepare.outputs.version }}" "/DSourceExe=$pwd\target\x86_64-pc-windows-msvc\release\resource_monitor.exe" packaging\windows\resource-monitor.iss
+      - name: Save Windows packages
+        uses: actions/upload-artifact@v4
         with:
-          project_id: ${{ vars.GCP_PROJECT_ID }}
-          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
-          service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
-      - name: Set up Google Cloud CLI
-        uses: google-github-actions/setup-gcloud@v3
-      - name: Upload Windows packages to Cloud Storage
-        shell: pwsh
-        run: |
-          gcloud storage cp dist\*-Windows-Setup.exe dist\*-Windows-Portable.zip "gs://${{ vars.GCP_DOWNLOAD_BUCKET }}/releases/v${{ steps.version.outputs.value }}/" --cache-control="public,max-age=31536000,immutable"
+          name: windows-packages
+          path: |
+            dist/*-Windows-Setup.exe
+            dist/*-Windows-Portable.zip
+          if-no-files-found: error
+          retention-days: 7
 
-  manifest:
-    needs: [macos, windows]
+  publish:
+    needs: [prepare, macos, windows]
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-      - name: Determine version
-        id: version
-        shell: bash
-        run: |
-          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
-            echo "value=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
-          else
-            echo "value=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)" >> "$GITHUB_OUTPUT"
-          fi
-      - name: Authenticate to Google Cloud
-        uses: google-github-actions/auth@v3
+      - name: Download built packages
+        uses: actions/download-artifact@v4
         with:
-          project_id: ${{ vars.GCP_PROJECT_ID }}
-          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
-          service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
-      - name: Set up Google Cloud CLI
-        uses: google-github-actions/setup-gcloud@v3
-      - name: Publish latest version manifest
+          pattern: "*-packages"
+          path: dist
+          merge-multiple: true
+      - name: Publish complete release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ needs.prepare.outputs.version }}
         shell: bash
         run: |
-          version="${{ steps.version.outputs.value }}"
-          bucket="${{ vars.GCP_DOWNLOAD_BUCKET }}"
-          base="https://storage.googleapis.com/${bucket}/releases/v${version}"
-          jq -n \
-            --arg version "v${version}" \
-            --arg published_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-            --arg macos "${base}/ResourceMonitor-${version}-macOS-Universal.dmg" \
-            --arg windows_installer "${base}/ResourceMonitor-${version}-Windows-Setup.exe" \
-            --arg windows_portable "${base}/ResourceMonitor-${version}-Windows-Portable.zip" \
-            '{version: $version, published_at: $published_at, files: {macos: $macos, windows_installer: $windows_installer, windows_portable: $windows_portable}}' \
-            > latest.json
-          gcloud storage cp latest.json "gs://${bucket}/latest.json" --cache-control="no-store,max-age=0"
+          set -euo pipefail
+          tag="v$VERSION"
+          files=(
+            "dist/ResourceMonitor-$VERSION-macOS-Universal.dmg"
+            "dist/ResourceMonitor-$VERSION-Windows-Setup.exe"
+            "dist/ResourceMonitor-$VERSION-Windows-Portable.zip"
+          )
+          for file in "${files[@]}"; do test -s "$file"; done
+          (cd dist && sha256sum ResourceMonitor-* > SHA256SUMS.txt)
+          if gh release view "$tag" --json isDraft > release-state.json 2>/dev/null; then
+            if ! jq -e '.isDraft == true' release-state.json > /dev/null; then
+              echo "::error::This release is already published. Use a new version tag."
+              exit 1
+            fi
+          else
+            gh release create "$tag" --verify-tag --draft --title "Resource Monitor $tag" --generate-notes
+          fi
+          gh release upload "$tag" "${files[@]}" dist/SHA256SUMS.txt --clobber
+          gh release edit "$tag" --draft=false

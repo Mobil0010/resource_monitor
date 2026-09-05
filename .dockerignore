@@ -1,8 +1,0 @@
-.git
-.github
-target
-dist
-packaging
-scripts
-src
-gha-creds-*.json
