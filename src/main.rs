@@ -2983,11 +2983,7 @@ fn main() -> eframe::Result {
                 .with_taskbar(false)
                 .with_mouse_passthrough(true)
                 .with_transparent(true),
-            renderer: if cfg!(target_os = "windows") {
-                eframe::Renderer::Glow
-            } else {
-                eframe::Renderer::Wgpu
-            },
+            renderer: native_renderer(),
             ..Default::default()
         };
         return eframe::run_native(
@@ -3012,11 +3008,7 @@ fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport,
         centered: true,
-        renderer: if cfg!(target_os = "windows") {
-            eframe::Renderer::Glow
-        } else {
-            eframe::Renderer::Wgpu
-        },
+        renderer: native_renderer(),
         ..Default::default()
     };
     eframe::run_native(
@@ -3024,4 +3016,14 @@ fn main() -> eframe::Result {
         options,
         Box::new(|cc| Ok(Box::new(App::new(cc)))),
     )
+}
+
+#[cfg(target_os = "windows")]
+fn native_renderer() -> eframe::Renderer {
+    eframe::Renderer::Glow
+}
+
+#[cfg(not(target_os = "windows"))]
+fn native_renderer() -> eframe::Renderer {
+    eframe::Renderer::Wgpu
 }
