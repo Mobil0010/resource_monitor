@@ -255,6 +255,8 @@ impl GpuInfo {
 }
 
 fn gpu_command_output(details: bool) -> String {
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    let _ = details;
     #[cfg(target_os = "macos")]
     let output = if details {
         Command::new("system_profiler")
@@ -2086,7 +2088,7 @@ fn launch_update(path: &std::path::Path) -> Result<(), String> {
             .spawn()
     };
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-    let result = Err(std::io::Error::new(
+    let result: std::io::Result<std::process::Child> = Err(std::io::Error::new(
         std::io::ErrorKind::Unsupported,
         "unsupported platform",
     ));
@@ -2207,7 +2209,10 @@ fn launch_agent_path() -> std::path::PathBuf {
         .join("Library/LaunchAgents/com.resource-monitor.plist")
 }
 fn set_autostart(enabled: bool) -> Result<(), String> {
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    let _ = enabled;
     #[cfg(target_os = "macos")]
     {
         let path = launch_agent_path();
