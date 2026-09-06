@@ -1,3 +1,5 @@
+#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
+
 use std::collections::VecDeque;
 #[cfg(target_os = "macos")]
 use std::ffi::{c_char, c_void};
@@ -14,7 +16,7 @@ use std::time::{Duration, Instant};
 use eframe::egui::{
     self, Align, Align2, Color32, FontId, Layout, Margin, RichText, Sense, Stroke, StrokeKind, Vec2,
 };
-use sysinfo::{Disks, Networks, ProcessesToUpdate, System};
+use sysinfo::{Components, Disks, Networks, ProcessesToUpdate, System};
 
 const BLUE: Color32 = Color32::from_rgb(92, 145, 255);
 const GREEN: Color32 = Color32::from_rgb(68, 196, 130);
@@ -298,11 +300,13 @@ fn extract_number(text: &str, key: &str) -> Option<f32> {
 
 struct App {
     sys: System,
+    components: Components,
     gpu: GpuInfo,
     disks: Disks,
     networks: Networks,
     page: Page,
     last: Instant,
+    last_temperature_refresh: Instant,
     cpu: VecDeque<f32>,
     gpu_history: VecDeque<f32>,
     memory: VecDeque<f32>,
@@ -334,12 +338,16 @@ struct App {
     last_update_check: Instant,
     available_update: Option<UpdateInfo>,
     dismissed_update: Option<String>,
+    update_download_rx: Option<Receiver<Result<std::path::PathBuf, String>>>,
+    downloaded_update: Option<std::path::PathBuf>,
+    update_download_error: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 struct UpdateInfo {
     version: String,
-    url: String,
+    asset_url: String,
+    asset_name: String,
 }
 
 #[derive(Clone)]
@@ -495,11 +503,13 @@ impl App {
         let update_rx = Some(start_update_check(cc.egui_ctx.clone()));
         let mut app = Self {
             sys: System::new(),
+            components: Components::new_with_refreshed_list(),
             gpu: GpuInfo::new(),
             disks: Disks::new_with_refreshed_list(),
             networks: Networks::new_with_refreshed_list(),
             page: Page::Overview,
             last: Instant::now() - Duration::from_secs(2),
+            last_temperature_refresh: Instant::now() - Duration::from_secs(10),
             cpu: VecDeque::new(),
             gpu_history: VecDeque::new(),
             memory: VecDeque::new(),
@@ -531,6 +541,9 @@ impl App {
             last_update_check: Instant::now(),
             available_update: None,
             dismissed_update: None,
+            update_download_rx: None,
+            downloaded_update: None,
+            update_download_error: None,
         };
         app.refresh();
         app
@@ -591,9 +604,34 @@ impl App {
         }
     }
 
+    fn poll_update_download(&mut self) {
+        let Some(receiver) = &self.update_download_rx else {
+            return;
+        };
+        match receiver.try_recv() {
+            Ok(Ok(path)) => {
+                self.downloaded_update = Some(path);
+                self.update_download_rx = None;
+            }
+            Ok(Err(error)) => {
+                self.update_download_error = Some(error);
+                self.update_download_rx = None;
+            }
+            Err(TryRecvError::Disconnected) => {
+                self.update_download_error = Some("Update download stopped.".to_owned());
+                self.update_download_rx = None;
+            }
+            Err(TryRecvError::Empty) => {}
+        }
+    }
+
     fn refresh(&mut self) {
         self.sys.refresh_cpu_usage();
         self.sys.refresh_memory();
+        if self.last_temperature_refresh.elapsed() >= Duration::from_secs(10) {
+            self.components.refresh(true);
+            self.last_temperature_refresh = Instant::now();
+        }
         let popup_visible = self.popup;
         if self.page == Page::Processes || (popup_visible && self.popup_processes) {
             self.sys.refresh_processes(ProcessesToUpdate::All, true);
@@ -768,6 +806,12 @@ impl App {
                     );
                     pair(ui, tr(self.language, "uptime"), &uptime(System::uptime()));
                     ui.end_row();
+                    pair(
+                        ui,
+                        tr(self.language, "temperatures"),
+                        &sensor_summary(&self.components),
+                    );
+                    ui.end_row();
                 });
         });
     }
@@ -783,7 +827,9 @@ impl App {
             ui,
             tr(self.language, "processor"),
             brand,
-            &format!("{:.1}%", self.sys.global_cpu_usage()),
+            &temperature_text(temperature_for(&self.components, "cpu"))
+                .map(|temperature| format!("{:.1}%  •  {temperature}", self.sys.global_cpu_usage()))
+                .unwrap_or_else(|| format!("{:.1}%", self.sys.global_cpu_usage())),
             BLUE,
         );
         ui.add_space(14.0);
@@ -821,7 +867,9 @@ impl App {
             ui,
             tr(self.language, "graphics_processor"),
             &format!("{} • {}", self.gpu.name, self.gpu.detail),
-            &format!("{:.1}%", self.gpu.usage),
+            &temperature_text(temperature_for(&self.components, "gpu"))
+                .map(|temperature| format!("{:.1}%  •  {temperature}", self.gpu.usage))
+                .unwrap_or_else(|| format!("{:.1}%", self.gpu.usage)),
             GREEN,
         );
         ui.add_space(14.0);
@@ -856,7 +904,9 @@ impl App {
             ui,
             tr(self.language, "physical_memory"),
             &format!("{} total", bytes(self.sys.total_memory())),
-            &format!("{usage:.1}%"),
+            &temperature_text(temperature_for(&self.components, "memory"))
+                .map(|temperature| format!("{usage:.1}%  •  {temperature}"))
+                .unwrap_or_else(|| format!("{usage:.1}%")),
             PURPLE,
         );
         ui.add_space(14.0);
@@ -898,14 +948,25 @@ impl App {
     }
 
     fn disks_page(&self, ui: &mut egui::Ui) {
-        ui.label(
-            RichText::new(format!(
-                "{}: {}",
-                tr(self.language, "mounted_volumes"),
-                self.disks.len()
-            ))
-            .weak(),
-        );
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new(format!(
+                    "{}: {}",
+                    tr(self.language, "mounted_volumes"),
+                    self.disks.len()
+                ))
+                .weak(),
+            );
+            if let Some(temperature) = temperature_text(temperature_for(&self.components, "disk")) {
+                ui.label(
+                    RichText::new(format!(
+                        "• {}: {temperature}",
+                        tr(self.language, "temperature")
+                    ))
+                    .color(ORANGE),
+                );
+            }
+        });
         ui.add_space(10.0);
         for d in &self.disks {
             let total = d.total_space();
@@ -1187,8 +1248,13 @@ impl App {
             self.popup_network,
         ];
         let count = shown.into_iter().filter(|shown| *shown).count().max(1);
+        let temperatures = metric_temperatures(&self.components);
+        let graph_count = [0, 1, 2, 5]
+            .into_iter()
+            .filter(|index| shown[*index])
+            .count();
         let graph_rows = if self.popup_graphs {
-            (count + 1) / 2
+            graph_count.div_ceil(2)
         } else {
             0
         };
@@ -1301,19 +1367,25 @@ impl App {
                         let colors = [BLUE, GREEN, PURPLE, ORANGE, GREEN, GREEN];
                         for index in 0..6 {
                             if shown[index] {
-                                let value = if index < 4 {
+                                let mut value = if index < 4 {
                                     format!("{:.1}%", values[index])
                                 } else if index == 4 {
                                     format!("{:.0}", values[index])
                                 } else {
                                     format!("↓ {}  ↑ {}", rate(network_down), rate(network_up))
                                 };
+                                if let Some(temperature) = temperature_text(temperatures[index]) {
+                                    value.push_str(&format!("  •  {temperature}"));
+                                }
                                 popup_row(ui, labels[index], &value, colors[index]);
                             }
                         }
                         if graphs {
                             ui.add_space(6.0);
-                            let indices: Vec<_> = (0..6).filter(|index| shown[*index]).collect();
+                            let indices: Vec<_> = [0, 1, 2, 5]
+                                .into_iter()
+                                .filter(|index| shown[*index])
+                                .collect();
                             for pair in indices.chunks(2) {
                                 ui.columns(2, |columns| {
                                     for (column, index) in pair.iter().enumerate() {
@@ -1352,6 +1424,7 @@ impl eframe::App for App {
             ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
         }
         self.poll_update_check(ctx);
+        self.poll_update_download();
         ctx.request_repaint_after(Duration::from_secs(self.refresh_secs));
     }
 
@@ -1427,7 +1500,11 @@ impl eframe::App for App {
             });
         if let Some(update) = self.available_update.clone() {
             egui::Panel::top("update_available")
-                .exact_size(46.0)
+                .exact_size(if self.update_download_error.is_some() {
+                    64.0
+                } else {
+                    46.0
+                })
                 .frame(
                     egui::Frame::new()
                         .fill(if self.dark {
@@ -1453,12 +1530,41 @@ impl eframe::App for App {
                                 self.dismissed_update = Some(update.version.clone());
                                 self.available_update = None;
                             }
-                            if ui.button(tr(self.language, "download_update")).clicked() {
-                                ui.ctx()
-                                    .open_url(egui::OpenUrl::new_tab(update.url.clone()));
+                            if let Some(path) = self.downloaded_update.clone() {
+                                if ui.button(tr(self.language, "install_update")).clicked()
+                                    && let Err(error) = launch_update(&path)
+                                {
+                                    self.update_download_error = Some(error);
+                                }
+                            } else if self.update_download_rx.is_some() {
+                                ui.add_enabled(
+                                    false,
+                                    egui::Button::new(tr(self.language, "downloading_update")),
+                                );
+                            } else if ui
+                                .button(tr(self.language, "download_install_update"))
+                                .clicked()
+                            {
+                                self.update_download_error = None;
+                                self.update_download_rx =
+                                    Some(start_update_download(update.clone(), ui.ctx().clone()));
+                            }
+                            if self.update_download_error.is_some()
+                                && ui.button(tr(self.language, "update_retry")).clicked()
+                            {
+                                self.update_download_error = None;
+                                self.update_download_rx =
+                                    Some(start_update_download(update.clone(), ui.ctx().clone()));
                             }
                         });
                     });
+                    if let Some(error) = &self.update_download_error {
+                        ui.label(
+                            RichText::new(error)
+                                .color(Color32::from_rgb(235, 95, 95))
+                                .size(10.0),
+                        );
+                    }
                 });
         }
         egui::CentralPanel::default()
@@ -1555,20 +1661,30 @@ impl PopupConfig {
         })
     }
 
-    fn window_height(&self) -> f32 {
+    fn window_height(&self, has_temperature: bool) -> f32 {
         let count = self.shown.into_iter().filter(|shown| *shown).count().max(1);
-        let graph_rows = if self.graphs { (count + 1) / 2 } else { 0 };
-        48.0 + count as f32 * 31.0 + graph_rows as f32 * 76.0
+        let graph_count = [0, 1, 2, 5]
+            .into_iter()
+            .filter(|index| self.shown[*index])
+            .count();
+        let graph_rows = if self.graphs {
+            graph_count.div_ceil(2)
+        } else {
+            0
+        };
+        48.0 + (count + usize::from(has_temperature)) as f32 * 31.0 + graph_rows as f32 * 76.0
     }
 }
 
 struct PopupApp {
     config: PopupConfig,
     sys: System,
+    components: Components,
     gpu: GpuInfo,
     disks: Disks,
     networks: Networks,
     last: Instant,
+    last_temperature_refresh: Instant,
     histories: [VecDeque<f32>; 6],
     config_text: String,
     last_config_check: Instant,
@@ -1582,10 +1698,12 @@ impl PopupApp {
         let mut app = Self {
             config,
             sys: System::new_all(),
+            components: Components::new_with_refreshed_list(),
             gpu: GpuInfo::new(),
             disks: Disks::new_with_refreshed_list(),
             networks: Networks::new_with_refreshed_list(),
             last: Instant::now() - Duration::from_secs(2),
+            last_temperature_refresh: Instant::now() - Duration::from_secs(10),
             histories: std::array::from_fn(|_| VecDeque::new()),
             config_text: String::new(),
             last_config_check: Instant::now() - Duration::from_secs(1),
@@ -1616,6 +1734,11 @@ impl PopupApp {
     fn refresh(&mut self) {
         self.sys.refresh_cpu_usage();
         self.sys.refresh_memory();
+        if self.last_temperature_refresh.elapsed() >= Duration::from_secs(10) {
+            self.components.refresh(true);
+            self.last_temperature_refresh = Instant::now();
+            self.layout_dirty = true;
+        }
         self.sys.refresh_processes(ProcessesToUpdate::All, true);
         self.gpu.refresh();
         self.disks.refresh(true);
@@ -1655,7 +1778,8 @@ impl eframe::App for PopupApp {
         let monitor = ctx
             .input(|i| i.viewport().monitor_size)
             .unwrap_or(Vec2::new(1920.0, 1080.0));
-        let size = Vec2::new(292.0, self.config.window_height());
+        let temperatures = metric_temperatures(&self.components);
+        let size = Vec2::new(292.0, self.config.window_height(false));
         let margin = 18.0;
         let center = (monitor.x - size.x) / 2.0;
         let right = monitor.x - size.x - margin;
@@ -1682,7 +1806,7 @@ impl eframe::App for PopupApp {
         if self.layout_dirty {
             ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(Vec2::new(
                 292.0,
-                self.config.window_height(),
+                self.config.window_height(false),
             )));
             ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos.into()));
             self.layout_dirty = false;
@@ -1725,19 +1849,25 @@ impl eframe::App for PopupApp {
                 let colors = [BLUE, GREEN, PURPLE, ORANGE, GREEN, GREEN];
                 for i in 0..6 {
                     if self.config.shown[i] {
-                        let value = if i < 4 {
+                        let mut value = if i < 4 {
                             format!("{:.1}%", values[i])
                         } else if i == 4 {
                             format!("{:.0}", values[i])
                         } else {
                             format!("↓ {}  ↑ {}", rate(network_down), rate(network_up))
                         };
+                        if let Some(temperature) = temperature_text(temperatures[i]) {
+                            value.push_str(&format!("  •  {temperature}"));
+                        }
                         popup_row(ui, labels[i], &value, colors[i]);
                     }
                 }
                 if self.config.graphs {
                     ui.add_space(6.0);
-                    let indices: Vec<_> = (0..6).filter(|i| self.config.shown[*i]).collect();
+                    let indices: Vec<_> = [0, 1, 2, 5]
+                        .into_iter()
+                        .filter(|index| self.config.shown[*index])
+                        .collect();
                     for pair in indices.chunks(2) {
                         ui.columns(2, |columns| {
                             for (column, index) in pair.iter().enumerate() {
@@ -1877,10 +2007,90 @@ fn latest_update_from_json(value: &serde_json::Value) -> Option<UpdateInfo> {
     if !url.starts_with("https://github.com/Mobil0010/resource_monitor/releases/tag/") {
         return None;
     }
+    let suffix = if cfg!(target_os = "macos") {
+        "-macOS-Universal.dmg"
+    } else if cfg!(target_os = "windows") {
+        "-Windows-Setup.exe"
+    } else {
+        return None;
+    };
+    let asset = value.get("assets")?.as_array()?.iter().find(|asset| {
+        asset
+            .get("name")
+            .and_then(|name| name.as_str())
+            .is_some_and(|name| name.starts_with("ResourceMonitor-") && name.ends_with(suffix))
+    })?;
+    let asset_name = asset.get("name")?.as_str()?;
+    let asset_url = asset.get("browser_download_url")?.as_str()?;
+    if !asset_url.starts_with("https://github.com/Mobil0010/resource_monitor/releases/download/")
+        || asset_name.contains(['/', '\\'])
+    {
+        return None;
+    }
     Some(UpdateInfo {
         version: format!("v{latest}"),
-        url: url.to_owned(),
+        asset_url: asset_url.to_owned(),
+        asset_name: asset_name.to_owned(),
     })
+}
+
+fn start_update_download(
+    update: UpdateInfo,
+    ctx: egui::Context,
+) -> Receiver<Result<std::path::PathBuf, String>> {
+    let (sender, receiver) = mpsc::channel();
+    std::thread::spawn(move || {
+        let result = download_update(&update);
+        let _ = sender.send(result);
+        ctx.request_repaint();
+    });
+    receiver
+}
+
+fn download_update(update: &UpdateInfo) -> Result<std::path::PathBuf, String> {
+    let directory = std::env::temp_dir().join("ResourceMonitorUpdate");
+    std::fs::create_dir_all(&directory).map_err(|error| error.to_string())?;
+    let path = directory.join(&update.asset_name);
+    let partial = directory.join(format!("{}.part", update.asset_name));
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_global(Some(Duration::from_secs(300)))
+        .build()
+        .into();
+    let mut response = agent
+        .get(&update.asset_url)
+        .header(
+            "User-Agent",
+            concat!("ResourceMonitor/", env!("CARGO_PKG_VERSION")),
+        )
+        .call()
+        .map_err(|error| error.to_string())?;
+    let mut file = std::fs::File::create(&partial).map_err(|error| error.to_string())?;
+    std::io::copy(&mut response.body_mut().as_reader(), &mut file)
+        .map_err(|error| error.to_string())?;
+    std::fs::rename(&partial, &path).map_err(|error| error.to_string())?;
+    Ok(path)
+}
+
+fn launch_update(path: &std::path::Path) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    let result = Command::new("open").arg(path).spawn();
+    #[cfg(target_os = "windows")]
+    let result = {
+        use std::os::windows::process::CommandExt;
+        Command::new("cmd")
+            .arg("/C")
+            .arg("start")
+            .arg("")
+            .arg(path)
+            .creation_flags(0x08000000)
+            .spawn()
+    };
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    let result = Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "unsupported platform",
+    ));
+    result.map(|_| ()).map_err(|error| error.to_string())
 }
 
 #[cfg(test)]
@@ -1922,15 +2132,28 @@ mod settings_tests {
 
     #[test]
     fn newer_github_release_is_detected() {
+        let suffix = if cfg!(target_os = "macos") {
+            "-macOS-Universal.dmg"
+        } else {
+            "-Windows-Setup.exe"
+        };
+        let asset_name = format!("ResourceMonitor-99.2.1{suffix}");
         let value = serde_json::json!({
             "tag_name": "v99.2.1",
-            "html_url": "https://github.com/Mobil0010/resource_monitor/releases/tag/v99.2.1"
+            "html_url": "https://github.com/Mobil0010/resource_monitor/releases/tag/v99.2.1",
+            "assets": [{
+                "name": asset_name,
+                "browser_download_url": format!("https://github.com/Mobil0010/resource_monitor/releases/download/v99.2.1/{asset_name}")
+            }]
         });
         assert_eq!(
             latest_update_from_json(&value),
             Some(UpdateInfo {
                 version: "v99.2.1".into(),
-                url: "https://github.com/Mobil0010/resource_monitor/releases/tag/v99.2.1".into(),
+                asset_url: format!(
+                    "https://github.com/Mobil0010/resource_monitor/releases/download/v99.2.1/{asset_name}"
+                ),
+                asset_name,
             })
         );
     }
@@ -2398,6 +2621,53 @@ fn bytes(n: u64) -> String {
 fn rate(n: u64) -> String {
     format!("{}/s", bytes(n))
 }
+fn temperature_for(components: &Components, category: &str) -> Option<f32> {
+    let aliases: &[&str] = match category {
+        "cpu" => &["cpu", "peci", "processor", "soc", "computer"],
+        "gpu" => &["gpu", "graphics"],
+        "memory" => &["memory", "ram", "dimm", "dram"],
+        "disk" => &["disk", "ssd", "nvme", "storage", "drive"],
+        _ => &[],
+    };
+    components
+        .iter()
+        .filter(|component| {
+            let label = component.label().to_ascii_lowercase();
+            aliases.iter().any(|alias| label.contains(alias))
+        })
+        .filter_map(|component| component.temperature())
+        .filter(|value| value.is_finite() && (-20.0..=150.0).contains(value))
+        .max_by(f32::total_cmp)
+}
+fn temperature_text(value: Option<f32>) -> Option<String> {
+    value.map(|temperature| format!("{temperature:.0} °C"))
+}
+fn metric_temperatures(components: &Components) -> [Option<f32>; 6] {
+    [
+        temperature_for(components, "cpu"),
+        temperature_for(components, "gpu"),
+        temperature_for(components, "memory"),
+        temperature_for(components, "disk"),
+        None,
+        None,
+    ]
+}
+fn sensor_summary(components: &Components) -> String {
+    let values: Vec<_> = components
+        .iter()
+        .filter_map(|component| {
+            let temperature = component.temperature()?;
+            (temperature.is_finite() && (-20.0..=150.0).contains(&temperature))
+                .then(|| format!("{}: {temperature:.0} °C", component.label()))
+        })
+        .take(6)
+        .collect();
+    if values.is_empty() {
+        "—".to_owned()
+    } else {
+        values.join("  •  ")
+    }
+}
 fn uptime(s: u64) -> String {
     let d = s / 86400;
     let h = s % 86400 / 3600;
@@ -2566,6 +2836,18 @@ fn tr<'a>(lang: Language, key: &'a str) -> &'a str {
         (Language::Japanese, "update_available") => "新しいバージョンがあります:",
         (Language::Korean, "download_update") => "업데이트 다운로드",
         (Language::Japanese, "download_update") => "アップデートをダウンロード",
+        (Language::Korean, "download_install_update") => "앱에서 다운로드",
+        (Language::Japanese, "download_install_update") => "アプリでダウンロード",
+        (Language::Korean, "downloading_update") => "다운로드 중…",
+        (Language::Japanese, "downloading_update") => "ダウンロード中…",
+        (Language::Korean, "install_update") => "업데이트 설치",
+        (Language::Japanese, "install_update") => "アップデートをインストール",
+        (Language::Korean, "update_retry") => "다시 시도",
+        (Language::Japanese, "update_retry") => "再試行",
+        (Language::Korean, "temperature") => "온도",
+        (Language::Japanese, "temperature") => "温度",
+        (Language::Korean, "temperatures") => "온도 센서",
+        (Language::Japanese, "temperatures") => "温度センサー",
         (Language::Korean, "later") => "나중에",
         (Language::Japanese, "later") => "後で",
         (_, "overview") => "Overview",
@@ -2641,6 +2923,12 @@ fn tr<'a>(lang: Language, key: &'a str) -> &'a str {
         (_, "no") => "No",
         (_, "update_available") => "A new version is available:",
         (_, "download_update") => "Download update",
+        (_, "download_install_update") => "Download in app",
+        (_, "downloading_update") => "Downloading…",
+        (_, "install_update") => "Install update",
+        (_, "update_retry") => "Retry",
+        (_, "temperature") => "Temperature",
+        (_, "temperatures") => "Temperature sensors",
         (_, "later") => "Later",
         _ => key,
     }
@@ -2695,6 +2983,11 @@ fn main() -> eframe::Result {
                 .with_taskbar(false)
                 .with_mouse_passthrough(true)
                 .with_transparent(true),
+            renderer: if cfg!(target_os = "windows") {
+                eframe::Renderer::Glow
+            } else {
+                eframe::Renderer::Wgpu
+            },
             ..Default::default()
         };
         return eframe::run_native(
@@ -2719,6 +3012,11 @@ fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport,
         centered: true,
+        renderer: if cfg!(target_os = "windows") {
+            eframe::Renderer::Glow
+        } else {
+            eframe::Renderer::Wgpu
+        },
         ..Default::default()
     };
     eframe::run_native(

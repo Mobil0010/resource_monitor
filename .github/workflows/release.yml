@@ -109,6 +109,31 @@ jobs:
           targets: x86_64-pc-windows-msvc
       - name: Build Windows executable
         run: cargo build --release --target x86_64-pc-windows-msvc
+      - name: Prepare Windows signing certificate
+        id: windows_signing
+        env:
+          WINDOWS_SIGNING_CERTIFICATE_BASE64: ${{ secrets.WINDOWS_SIGNING_CERTIFICATE_BASE64 }}
+        shell: pwsh
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:WINDOWS_SIGNING_CERTIFICATE_BASE64)) {
+            "enabled=false" >> $env:GITHUB_OUTPUT
+            exit 0
+          }
+          [IO.File]::WriteAllBytes(
+            "$env:RUNNER_TEMP\resource-monitor-signing.pfx",
+            [Convert]::FromBase64String($env:WINDOWS_SIGNING_CERTIFICATE_BASE64)
+          )
+          "enabled=true" >> $env:GITHUB_OUTPUT
+      - name: Sign Windows executable
+        if: ${{ steps.windows_signing.outputs.enabled == 'true' }}
+        env:
+          WINDOWS_SIGNING_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_SIGNING_CERTIFICATE_PASSWORD }}
+        shell: pwsh
+        run: |
+          signtool sign /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 `
+            /f "$env:RUNNER_TEMP\resource-monitor-signing.pfx" `
+            /p "$env:WINDOWS_SIGNING_CERTIFICATE_PASSWORD" `
+            target\x86_64-pc-windows-msvc\release\resource_monitor.exe
       - name: Build portable ZIP
         shell: pwsh
         run: |
@@ -120,6 +145,20 @@ jobs:
         shell: pwsh
         run: |
           & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" "/DAppVersion=${{ needs.prepare.outputs.version }}" "/DSourceExe=$pwd\target\x86_64-pc-windows-msvc\release\resource_monitor.exe" packaging\windows\resource-monitor.iss
+      - name: Sign Windows installer
+        if: ${{ steps.windows_signing.outputs.enabled == 'true' }}
+        env:
+          WINDOWS_SIGNING_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_SIGNING_CERTIFICATE_PASSWORD }}
+        shell: pwsh
+        run: |
+          signtool sign /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 `
+            /f "$env:RUNNER_TEMP\resource-monitor-signing.pfx" `
+            /p "$env:WINDOWS_SIGNING_CERTIFICATE_PASSWORD" `
+            "dist\ResourceMonitor-${{ needs.prepare.outputs.version }}-Windows-Setup.exe"
+      - name: Remove signing certificate
+        if: ${{ always() && steps.windows_signing.outputs.enabled == 'true' }}
+        shell: pwsh
+        run: Remove-Item "$env:RUNNER_TEMP\resource-monitor-signing.pfx" -Force -ErrorAction SilentlyContinue
       - name: Save Windows packages
         uses: actions/upload-artifact@v4
         with:

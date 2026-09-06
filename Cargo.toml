@@ -4,7 +4,7 @@ version = "0.1.5"
 edition = "2024"
 
 [dependencies]
-eframe = { version = "0.36.1", default-features = false, features = ["accesskit", "default_fonts", "links", "wgpu"] }
+eframe = { version = "0.36.1", default-features = false, features = ["accesskit", "default_fonts", "glow", "links", "wgpu"] }
 semver = "1.0.28"
 serde_json = "1.0.151"
 sysinfo = "0.38.4"

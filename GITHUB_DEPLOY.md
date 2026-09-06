@@ -56,6 +56,13 @@ Actions의 **Build and publish GitHub release**가 다음 파일을 생성합니
 
 현재 macOS 빌드는 ad-hoc 서명이며 Apple 공증은 자동 구성되어 있지 않습니다. Windows 설치 파일도 별도의 코드 서명 인증서를 설정하지 않았습니다. 따라서 macOS Gatekeeper나 Windows SmartScreen 경고가 나타날 수 있습니다. GitHub에 게시하는 것만으로 운영체제의 신뢰 서명이나 공증을 받는 것은 아닙니다.
 
+Windows Smart App Control을 통과하려면 Microsoft 신뢰 루트 프로그램에 포함된 공급자가 발급한 RSA 코드 서명 인증서가 필요합니다. 인증서를 PFX 형식으로 준비한 뒤 저장소의 Settings → Secrets and variables → Actions에 아래 두 값을 등록하면 실행 파일과 설치 마법사를 자동 서명합니다.
+
+- `WINDOWS_SIGNING_CERTIFICATE_BASE64`: PFX 파일을 Base64로 인코딩한 값
+- `WINDOWS_SIGNING_CERTIFICATE_PASSWORD`: PFX 암호
+
+인증서가 등록되지 않은 빌드는 계속 정상 생성되지만 Smart App Control에서 차단될 수 있습니다. 자체 서명 인증서만으로는 일반 사용자 컴퓨터의 신뢰를 얻을 수 없습니다.
+
 ## 5. 기존 GCP 설정 정리
 
 이 구성으로 전환해도 이미 생성한 GCP 리소스는 자동 삭제되거나 중지되지 않습니다. Cloud Run, Cloud Storage, Artifact Registry 등 사용 중인 리소스와 비용을 확인해 주세요. 필요한 파일을 백업하고 전환 완료를 확인한 뒤 불필요한 리소스를 별도로 정리해야 합니다.
