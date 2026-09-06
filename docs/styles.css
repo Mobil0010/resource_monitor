@@ -45,12 +45,14 @@ h1 em { color: var(--green); font-style: normal; }
 .version { margin-left: auto; color: var(--muted); font-family: var(--mono); font-size: .75rem; }
 .install-heading { margin: 0 0 8px; font-size: 1.45rem; letter-spacing: -.035em; }
 .install-description { min-height: 44px; margin: 0 0 18px; color: var(--muted); font-size: .9rem; line-height: 1.55; }
-.download-actions { display: flex; gap: 10px; }
+.download-actions { display: flex; flex-wrap: wrap; gap: 10px; }
+.download-actions > .button { flex-shrink: 0; white-space: nowrap; }
 .button { min-height: 54px; border: 1px solid transparent; border-radius: 8px; display: inline-flex; align-items: center; justify-content: center; gap: 9px; padding: 0 22px; cursor: pointer; font-weight: 600; transition: transform .2s, border-color .2s, background .2s; }
 .button:hover { transform: translateY(-2px); }
 .button:focus-visible, .platform-menu a:focus-visible { outline: 2px solid var(--green); outline-offset: 3px; }
-.button-primary { flex: 1; background: var(--green); color: #07130e; }
+.button-primary { flex: 1 0 auto; background: var(--green); color: #07130e; }
 .button-primary svg { width: 20px; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+.button-primary svg { height: 20px; flex-shrink: 0; }
 .button-primary[aria-disabled="true"] { opacity: .55; pointer-events: none; }
 .button-secondary { color: var(--text); background: var(--panel); border-color: var(--line); }
 .button-secondary:hover { border-color: rgba(255,255,255,.24); }

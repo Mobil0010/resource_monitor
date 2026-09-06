@@ -1,6 +1,10 @@
 use std::collections::VecDeque;
 use std::process::Command;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::{Duration, Instant};
 
 use eframe::egui::{
@@ -13,6 +17,8 @@ const GREEN: Color32 = Color32::from_rgb(68, 196, 130);
 const PURPLE: Color32 = Color32::from_rgb(170, 112, 255);
 const ORANGE: Color32 = Color32::from_rgb(246, 162, 74);
 const HISTORY: usize = 60;
+const UPDATE_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
+const RELEASE_API: &str = "https://api.github.com/repos/Mobil0010/resource_monitor/releases/latest";
 
 #[derive(Clone, Copy, PartialEq)]
 enum Page {
@@ -51,7 +57,7 @@ impl Page {
     }
 }
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 enum Language {
     English,
     Korean,
@@ -73,6 +79,12 @@ impl Language {
             2 => Self::Japanese,
             _ => Self::English,
         }
+    }
+    fn code(self) -> u8 {
+        Self::ALL
+            .iter()
+            .position(|value| *value == self)
+            .unwrap_or(0) as u8
     }
 }
 
@@ -110,6 +122,12 @@ impl PopupPosition {
             .get(code as usize)
             .copied()
             .unwrap_or(Self::TopRight)
+    }
+    fn code(self) -> u8 {
+        Self::ALL
+            .iter()
+            .position(|value| *value == self)
+            .unwrap_or(2) as u8
     }
 }
 
@@ -240,6 +258,8 @@ struct App {
     search: String,
     dark: bool,
     popup: bool,
+    popup_closed: Arc<AtomicBool>,
+    exiting: bool,
     popup_position: PopupPosition,
     popup_cpu: bool,
     popup_gpu: bool,
@@ -254,18 +274,168 @@ struct App {
     autostart: bool,
     settings_message: Option<String>,
     refresh_secs: u64,
+    saved_settings: String,
+    update_rx: Option<Receiver<Option<UpdateInfo>>>,
+    last_update_check: Instant,
+    available_update: Option<UpdateInfo>,
+    dismissed_update: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct UpdateInfo {
+    version: String,
+    url: String,
+}
+
+#[derive(Clone)]
+struct SavedSettings {
+    dark: bool,
+    popup: bool,
+    popup_position: PopupPosition,
+    popup_cpu: bool,
+    popup_gpu: bool,
+    popup_memory: bool,
+    popup_disk: bool,
+    popup_processes: bool,
+    popup_network: bool,
+    popup_opacity: f32,
+    language: Language,
+    popup_graphs: bool,
+    refresh_secs: u64,
+}
+
+impl SavedSettings {
+    fn defaults(dark: bool) -> Self {
+        Self {
+            dark,
+            popup: false,
+            popup_position: PopupPosition::TopRight,
+            popup_cpu: true,
+            popup_gpu: false,
+            popup_memory: true,
+            popup_disk: false,
+            popup_processes: false,
+            popup_network: true,
+            popup_opacity: 0.92,
+            language: Language::English,
+            popup_graphs: true,
+            refresh_secs: 2,
+        }
+    }
+
+    fn load(system_dark: bool) -> Self {
+        let mut settings = Self::defaults(system_dark);
+        let Ok(value) = std::fs::read_to_string(settings_file()) else {
+            return settings;
+        };
+        settings.apply(&value);
+        settings
+    }
+
+    fn apply(&mut self, value: &str) {
+        for line in value.lines() {
+            let Some((key, value)) = line.split_once('=') else {
+                continue;
+            };
+            match key {
+                "dark" => self.dark = parse_bool(value).unwrap_or(self.dark),
+                "popup" => self.popup = parse_bool(value).unwrap_or(self.popup),
+                "popup_position" => {
+                    self.popup_position = value
+                        .parse::<u8>()
+                        .ok()
+                        .map(PopupPosition::from_code)
+                        .unwrap_or(self.popup_position)
+                }
+                "popup_cpu" => self.popup_cpu = parse_bool(value).unwrap_or(self.popup_cpu),
+                "popup_gpu" => self.popup_gpu = parse_bool(value).unwrap_or(self.popup_gpu),
+                "popup_memory" => {
+                    self.popup_memory = parse_bool(value).unwrap_or(self.popup_memory)
+                }
+                "popup_disk" => self.popup_disk = parse_bool(value).unwrap_or(self.popup_disk),
+                "popup_processes" => {
+                    self.popup_processes = parse_bool(value).unwrap_or(self.popup_processes)
+                }
+                "popup_network" => {
+                    self.popup_network = parse_bool(value).unwrap_or(self.popup_network)
+                }
+                "popup_opacity" => {
+                    if let Ok(opacity) = value.parse::<f32>()
+                        && opacity.is_finite()
+                    {
+                        self.popup_opacity = opacity.clamp(0.30, 1.0);
+                    }
+                }
+                "language" => {
+                    self.language = value
+                        .parse::<u8>()
+                        .ok()
+                        .map(Language::from_code)
+                        .unwrap_or(self.language)
+                }
+                "popup_graphs" => {
+                    self.popup_graphs = parse_bool(value).unwrap_or(self.popup_graphs)
+                }
+                "refresh_secs" => {
+                    self.refresh_secs = value
+                        .parse::<u64>()
+                        .unwrap_or(self.refresh_secs)
+                        .clamp(1, 10)
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn encode(&self) -> String {
+        format!(
+            concat!(
+                "version=1\n",
+                "dark={}\n",
+                "popup={}\n",
+                "popup_position={}\n",
+                "popup_cpu={}\n",
+                "popup_gpu={}\n",
+                "popup_memory={}\n",
+                "popup_disk={}\n",
+                "popup_processes={}\n",
+                "popup_network={}\n",
+                "popup_opacity={:.3}\n",
+                "language={}\n",
+                "popup_graphs={}\n",
+                "refresh_secs={}\n"
+            ),
+            u8::from(self.dark),
+            u8::from(self.popup),
+            self.popup_position.code(),
+            u8::from(self.popup_cpu),
+            u8::from(self.popup_gpu),
+            u8::from(self.popup_memory),
+            u8::from(self.popup_disk),
+            u8::from(self.popup_processes),
+            u8::from(self.popup_network),
+            self.popup_opacity,
+            self.language.code(),
+            u8::from(self.popup_graphs),
+            self.refresh_secs,
+        )
+    }
 }
 
 impl App {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         configure_fonts(&cc.egui_ctx);
-        let dark = matches!(
+        let system_dark = matches!(
             cc.egui_ctx
                 .system_theme()
                 .unwrap_or_else(|| cc.egui_ctx.theme()),
             egui::Theme::Dark
         );
+        let settings = SavedSettings::load(system_dark);
+        let dark = settings.dark;
         set_style(&cc.egui_ctx, dark);
+        let saved_settings = settings.encode();
+        let update_rx = Some(start_update_check(cc.egui_ctx.clone()));
         let mut app = Self {
             sys: System::new(),
             gpu: GpuInfo::new(),
@@ -282,24 +452,86 @@ impl App {
             process_history: VecDeque::new(),
             search: String::new(),
             dark,
-            popup: false,
-            popup_position: PopupPosition::TopRight,
-            popup_cpu: true,
-            popup_gpu: false,
-            popup_memory: true,
-            popup_disk: false,
-            popup_processes: false,
-            popup_network: true,
-            popup_opacity: 0.92,
-            language: Language::English,
-            popup_graphs: true,
+            popup: settings.popup,
+            popup_closed: Arc::new(AtomicBool::new(false)),
+            exiting: false,
+            popup_position: settings.popup_position,
+            popup_cpu: settings.popup_cpu,
+            popup_gpu: settings.popup_gpu,
+            popup_memory: settings.popup_memory,
+            popup_disk: settings.popup_disk,
+            popup_processes: settings.popup_processes,
+            popup_network: settings.popup_network,
+            popup_opacity: settings.popup_opacity,
+            language: settings.language,
+            popup_graphs: settings.popup_graphs,
             confirm_exit: false,
             autostart: autostart_enabled(),
             settings_message: None,
-            refresh_secs: 2,
+            refresh_secs: settings.refresh_secs,
+            saved_settings,
+            update_rx,
+            last_update_check: Instant::now(),
+            available_update: None,
+            dismissed_update: None,
         };
         app.refresh();
         app
+    }
+
+    fn current_settings(&self) -> SavedSettings {
+        SavedSettings {
+            dark: self.dark,
+            popup: self.popup,
+            popup_position: self.popup_position,
+            popup_cpu: self.popup_cpu,
+            popup_gpu: self.popup_gpu,
+            popup_memory: self.popup_memory,
+            popup_disk: self.popup_disk,
+            popup_processes: self.popup_processes,
+            popup_network: self.popup_network,
+            popup_opacity: self.popup_opacity,
+            language: self.language,
+            popup_graphs: self.popup_graphs,
+            refresh_secs: self.refresh_secs,
+        }
+    }
+
+    fn save_settings_if_changed(&mut self) {
+        // 종료를 위해 팝업을 숨기는 내부 상태는 사용자의 팝업 설정을 덮어쓰지 않습니다.
+        if self.exiting {
+            return;
+        }
+        let value = self.current_settings().encode();
+        if value == self.saved_settings {
+            return;
+        }
+        match save_settings(&value) {
+            Ok(()) => {
+                self.saved_settings = value;
+                self.settings_message = None;
+            }
+            Err(error) => self.settings_message = Some(error),
+        }
+    }
+
+    fn poll_update_check(&mut self, ctx: &egui::Context) {
+        if let Some(receiver) = &self.update_rx {
+            match receiver.try_recv() {
+                Ok(update) => {
+                    self.available_update = update.filter(|value| {
+                        self.dismissed_update.as_deref() != Some(value.version.as_str())
+                    });
+                    self.update_rx = None;
+                }
+                Err(TryRecvError::Disconnected) => self.update_rx = None,
+                Err(TryRecvError::Empty) => {}
+            }
+        }
+        if self.update_rx.is_none() && self.last_update_check.elapsed() >= UPDATE_INTERVAL {
+            self.update_rx = Some(start_update_check(ctx.clone()));
+            self.last_update_check = Instant::now();
+        }
     }
 
     fn refresh(&mut self) {
@@ -879,6 +1111,9 @@ impl App {
     }
 
     fn show_popup(&mut self, ctx: &egui::Context) {
+        if self.popup_closed.swap(false, Ordering::Relaxed) {
+            self.popup = false;
+        }
         if !self.popup {
             return;
         }
@@ -945,12 +1180,12 @@ impl App {
             .map(|(_, n)| n.transmitted())
             .sum::<u64>();
         let histories = [
-            &self.cpu,
-            &self.gpu_history,
-            &self.memory,
-            &self.disk_history,
-            &self.process_history,
-            &self.down,
+            self.cpu.clone(),
+            self.gpu_history.clone(),
+            self.memory.clone(),
+            self.disk_history.clone(),
+            self.process_history.clone(),
+            self.down.clone(),
         ];
         let dark = self.dark;
         let opacity = self.popup_opacity;
@@ -963,8 +1198,13 @@ impl App {
             .with_resizable(false)
             .with_decorations(false)
             .with_always_on_top()
+            .with_taskbar(false)
             .with_transparent(true);
-        let closed = ctx.show_viewport_immediate(
+        // 부모 창의 최소화/복원 중에도 팝업은 별도의 렌더링 콜백을 사용합니다.
+        // 작은 읽기 전용 스냅샷을 전달하여 UI 사이에 잠금이나 중첩 렌더링이 없습니다.
+        let popup_closed = Arc::clone(&self.popup_closed);
+        let refresh_interval = Duration::from_secs(self.refresh_secs);
+        ctx.show_viewport_deferred(
             egui::ViewportId::from_hash_of("monitor_popup"),
             builder,
             move |ui, _| {
@@ -1022,7 +1262,7 @@ impl App {
                                         mini_chart(
                                             &mut columns[column],
                                             labels[*index],
-                                            histories[*index],
+                                            &histories[*index],
                                             colors[*index],
                                         );
                                     }
@@ -1031,19 +1271,29 @@ impl App {
                             }
                         }
                     });
-                ui.ctx().input(|i| i.viewport().close_requested())
+                if ui.ctx().input(|i| i.viewport().close_requested()) {
+                    popup_closed.store(true, Ordering::Relaxed);
+                    ui.ctx().request_repaint_of(egui::ViewportId::ROOT);
+                }
+                ui.ctx().request_repaint_after(refresh_interval);
+                ui.ctx()
+                    .request_repaint_after_for(refresh_interval, egui::ViewportId::ROOT);
             },
         );
-        if closed {
-            self.popup = false;
-        }
+        // 값 또는 설정이 갱신되면 다음 주기까지 기다리지 않고 팝업에 반영합니다.
+        ctx.request_repaint_of(egui::ViewportId::from_hash_of("monitor_popup"));
     }
 }
 
 impl eframe::App for App {
+    fn logic(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
+        self.poll_update_check(ctx);
+        ctx.request_repaint_after(Duration::from_secs(self.refresh_secs));
+    }
+
     fn ui(&mut self, root: &mut egui::Ui, _: &mut eframe::Frame) {
         let ctx = root.ctx().clone();
-        if self.popup && ctx.input(|input| input.viewport().close_requested()) {
+        if self.popup && !self.exiting && ctx.input(|input| input.viewport().close_requested()) {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
         }
@@ -1105,6 +1355,42 @@ impl eframe::App for App {
                     });
                 });
             });
+        if let Some(update) = self.available_update.clone() {
+            egui::Panel::top("update_available")
+                .exact_size(46.0)
+                .frame(
+                    egui::Frame::new()
+                        .fill(if self.dark {
+                            Color32::from_rgb(24, 50, 39)
+                        } else {
+                            Color32::from_rgb(224, 247, 235)
+                        })
+                        .inner_margin(Margin::symmetric(24, 8)),
+                )
+                .show(root, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            RichText::new(format!(
+                                "{} {}",
+                                tr(self.language, "update_available"),
+                                update.version
+                            ))
+                            .strong()
+                            .color(GREEN),
+                        );
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if ui.button(tr(self.language, "later")).clicked() {
+                                self.dismissed_update = Some(update.version.clone());
+                                self.available_update = None;
+                            }
+                            if ui.button(tr(self.language, "download_update")).clicked() {
+                                ui.ctx()
+                                    .open_url(egui::OpenUrl::new_tab(update.url.clone()));
+                            }
+                        });
+                    });
+                });
+        }
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::new()
@@ -1143,12 +1429,16 @@ impl eframe::App for App {
             });
             match answer {
                 Some(true) => {
+                    self.exiting = true;
+                    self.confirm_exit = false;
+                    self.popup = false;
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 }
                 Some(false) => self.confirm_exit = false,
                 None => {}
             }
         }
+        self.save_settings_if_changed();
         ctx.request_repaint_after(
             Duration::from_secs(self.refresh_secs).saturating_sub(self.last.elapsed()),
         );
@@ -1427,6 +1717,173 @@ fn shutdown_file() -> std::path::PathBuf {
 
 fn popup_config_file() -> std::path::PathBuf {
     std::env::temp_dir().join("resource_monitor.popup.conf")
+}
+
+fn parse_bool(value: &str) -> Option<bool> {
+    match value.trim() {
+        "1" | "true" => Some(true),
+        "0" | "false" => Some(false),
+        _ => None,
+    }
+}
+
+fn settings_file() -> std::path::PathBuf {
+    #[cfg(target_os = "macos")]
+    {
+        return std::env::var_os("HOME")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir)
+            .join("Library/Application Support/Resource Monitor/settings.conf");
+    }
+    #[cfg(target_os = "windows")]
+    {
+        return std::env::var_os("APPDATA")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir)
+            .join("Resource Monitor/settings.conf");
+    }
+    #[allow(unreachable_code)]
+    std::env::var_os("XDG_CONFIG_HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            std::env::var_os("HOME")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(std::env::temp_dir)
+                .join(".config")
+        })
+        .join("resource-monitor/settings.conf")
+}
+
+fn save_settings(value: &str) -> Result<(), String> {
+    let path = settings_file();
+    let parent = path
+        .parent()
+        .ok_or_else(|| "설정 파일 경로를 만들 수 없습니다.".to_owned())?;
+    std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    std::fs::write(path, value).map_err(|error| error.to_string())
+}
+
+fn start_update_check(ctx: egui::Context) -> Receiver<Option<UpdateInfo>> {
+    let (sender, receiver) = mpsc::channel();
+    std::thread::spawn(move || {
+        let update = fetch_latest_update().ok().flatten();
+        let _ = sender.send(update);
+        ctx.request_repaint();
+    });
+    receiver
+}
+
+fn fetch_latest_update() -> Result<Option<UpdateInfo>, String> {
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_global(Some(Duration::from_secs(8)))
+        .build()
+        .into();
+    let mut response = agent
+        .get(RELEASE_API)
+        .header("Accept", "application/vnd.github+json")
+        .header("X-GitHub-Api-Version", "2022-11-28")
+        .header(
+            "User-Agent",
+            concat!("ResourceMonitor/", env!("CARGO_PKG_VERSION")),
+        )
+        .call()
+        .map_err(|error| error.to_string())?;
+    let value: serde_json::Value = response
+        .body_mut()
+        .read_json()
+        .map_err(|error| error.to_string())?;
+    Ok(latest_update_from_json(&value))
+}
+
+fn latest_update_from_json(value: &serde_json::Value) -> Option<UpdateInfo> {
+    let tag = value.get("tag_name")?.as_str()?;
+    let version_text = tag.strip_prefix('v').unwrap_or(tag);
+    let latest = semver::Version::parse(version_text).ok()?;
+    let current = semver::Version::parse(env!("CARGO_PKG_VERSION")).ok()?;
+    if latest <= current {
+        return None;
+    }
+    let url = value.get("html_url")?.as_str()?;
+    if !url.starts_with("https://github.com/Mobil0010/resource_monitor/releases/tag/") {
+        return None;
+    }
+    Some(UpdateInfo {
+        version: format!("v{latest}"),
+        url: url.to_owned(),
+    })
+}
+
+#[cfg(test)]
+mod settings_tests {
+    use super::*;
+
+    #[test]
+    fn settings_round_trip() {
+        let expected = SavedSettings {
+            dark: false,
+            popup: true,
+            popup_position: PopupPosition::BottomCenter,
+            popup_cpu: false,
+            popup_gpu: true,
+            popup_memory: false,
+            popup_disk: true,
+            popup_processes: true,
+            popup_network: false,
+            popup_opacity: 0.617,
+            language: Language::Japanese,
+            popup_graphs: false,
+            refresh_secs: 7,
+        };
+        let encoded = expected.encode();
+        let mut actual = SavedSettings::defaults(true);
+        actual.apply(&encoded);
+        assert_eq!(actual.encode(), encoded);
+    }
+
+    #[test]
+    fn invalid_values_are_ignored_or_clamped() {
+        let mut settings = SavedSettings::defaults(true);
+        settings.apply("dark=invalid\npopup_opacity=9\nrefresh_secs=0\nlanguage=99\n");
+        assert!(settings.dark);
+        assert_eq!(settings.popup_opacity, 1.0);
+        assert_eq!(settings.refresh_secs, 1);
+        assert_eq!(settings.language, Language::English);
+    }
+
+    #[test]
+    fn newer_github_release_is_detected() {
+        let value = serde_json::json!({
+            "tag_name": "v99.2.1",
+            "html_url": "https://github.com/Mobil0010/resource_monitor/releases/tag/v99.2.1"
+        });
+        assert_eq!(
+            latest_update_from_json(&value),
+            Some(UpdateInfo {
+                version: "v99.2.1".into(),
+                url: "https://github.com/Mobil0010/resource_monitor/releases/tag/v99.2.1".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn old_invalid_or_untrusted_releases_are_ignored() {
+        for value in [
+            serde_json::json!({
+                "tag_name": env!("CARGO_PKG_VERSION"),
+                "html_url": "https://github.com/Mobil0010/resource_monitor/releases/tag/current"
+            }),
+            serde_json::json!({
+                "tag_name": "not-a-version",
+                "html_url": "https://github.com/Mobil0010/resource_monitor/releases/tag/test"
+            }),
+            serde_json::json!({
+                "tag_name": "v99.0.0",
+                "html_url": "https://example.com/download"
+            }),
+        ] {
+            assert_eq!(latest_update_from_json(&value), None);
+        }
+    }
 }
 
 fn autostart_enabled() -> bool {
@@ -2035,6 +2492,12 @@ fn tr<'a>(lang: Language, key: &'a str) -> &'a str {
         (Language::Japanese, "yes") => "はい",
         (Language::Korean, "no") => "아니오",
         (Language::Japanese, "no") => "いいえ",
+        (Language::Korean, "update_available") => "새 버전을 사용할 수 있습니다:",
+        (Language::Japanese, "update_available") => "新しいバージョンがあります:",
+        (Language::Korean, "download_update") => "업데이트 다운로드",
+        (Language::Japanese, "download_update") => "アップデートをダウンロード",
+        (Language::Korean, "later") => "나중에",
+        (Language::Japanese, "later") => "後で",
         (_, "overview") => "Overview",
         (_, "cpu") => "CPU",
         (_, "memory") => "Memory",
@@ -2106,6 +2569,9 @@ fn tr<'a>(lang: Language, key: &'a str) -> &'a str {
         (_, "quit_question") => "This closes both the main window and popup.",
         (_, "yes") => "Yes",
         (_, "no") => "No",
+        (_, "update_available") => "A new version is available:",
+        (_, "download_update") => "Download update",
+        (_, "later") => "Later",
         _ => key,
     }
 }
@@ -2156,6 +2622,7 @@ fn main() -> eframe::Result {
                 .with_resizable(false)
                 .with_decorations(false)
                 .with_always_on_top()
+                .with_taskbar(false)
                 .with_transparent(true),
             ..Default::default()
         };
