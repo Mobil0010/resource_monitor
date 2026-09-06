@@ -1,5 +1,9 @@
 use std::collections::VecDeque;
+#[cfg(target_os = "macos")]
+use std::ffi::{c_char, c_void};
 use std::process::Command;
+#[cfg(target_os = "macos")]
+use std::sync::OnceLock;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::{
     Arc,
@@ -19,6 +23,57 @@ const ORANGE: Color32 = Color32::from_rgb(246, 162, 74);
 const HISTORY: usize = 60;
 const UPDATE_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 const RELEASE_API: &str = "https://api.github.com/repos/Mobil0010/resource_monitor/releases/latest";
+
+#[cfg(target_os = "macos")]
+static MAC_REOPEN_REQUESTED: AtomicBool = AtomicBool::new(false);
+#[cfg(target_os = "macos")]
+static MAC_EGUI_CONTEXT: OnceLock<egui::Context> = OnceLock::new();
+
+#[cfg(target_os = "macos")]
+#[link(name = "objc")]
+unsafe extern "C" {
+    fn objc_getClass(name: *const c_char) -> *mut c_void;
+    fn sel_registerName(name: *const c_char) -> *const c_void;
+    fn class_addMethod(
+        class: *mut c_void,
+        selector: *const c_void,
+        implementation: *const c_void,
+        types: *const c_char,
+    ) -> i8;
+}
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" fn mac_application_should_handle_reopen(
+    _: *mut c_void,
+    _: *const c_void,
+    _: *mut c_void,
+    _: i8,
+) -> i8 {
+    MAC_REOPEN_REQUESTED.store(true, Ordering::Release);
+    if let Some(ctx) = MAC_EGUI_CONTEXT.get() {
+        ctx.request_repaint();
+    }
+    1
+}
+
+#[cfg(target_os = "macos")]
+fn install_macos_reopen_handler(ctx: &egui::Context) {
+    let _ = MAC_EGUI_CONTEXT.set(ctx.clone());
+    // winit이 등록한 앱 델리게이트는 유지하고, 구현하지 않은 Dock 재열기 콜백만 추가합니다.
+    unsafe {
+        let class = objc_getClass(c"WinitApplicationDelegate".as_ptr());
+        if !class.is_null() {
+            let selector =
+                sel_registerName(c"applicationShouldHandleReopen:hasVisibleWindows:".as_ptr());
+            class_addMethod(
+                class,
+                selector,
+                mac_application_should_handle_reopen as *const () as *const c_void,
+                c"c@:@c".as_ptr(),
+            );
+        }
+    }
+}
 
 #[derive(Clone, Copy, PartialEq)]
 enum Page {
@@ -425,6 +480,8 @@ impl SavedSettings {
 impl App {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         configure_fonts(&cc.egui_ctx);
+        #[cfg(target_os = "macos")]
+        install_macos_reopen_handler(&cc.egui_ctx);
         let system_dark = matches!(
             cc.egui_ctx
                 .system_theme()
@@ -1199,6 +1256,7 @@ impl App {
             .with_decorations(false)
             .with_always_on_top()
             .with_taskbar(false)
+            .with_mouse_passthrough(true)
             .with_transparent(true);
         // 부모 창의 최소화/복원 중에도 팝업은 별도의 렌더링 콜백을 사용합니다.
         // 작은 읽기 전용 스냅샷을 전달하여 UI 사이에 잠금이나 중첩 렌더링이 없습니다.
@@ -1287,12 +1345,24 @@ impl App {
 
 impl eframe::App for App {
     fn logic(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
+        #[cfg(target_os = "macos")]
+        if MAC_REOPEN_REQUESTED.swap(false, Ordering::AcqRel) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        }
         self.poll_update_check(ctx);
         ctx.request_repaint_after(Duration::from_secs(self.refresh_secs));
     }
 
     fn ui(&mut self, root: &mut egui::Ui, _: &mut eframe::Frame) {
         let ctx = root.ctx().clone();
+        #[cfg(target_os = "macos")]
+        if !self.exiting && ctx.input(|input| input.viewport().close_requested()) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        }
+        #[cfg(not(target_os = "macos"))]
         if self.popup && !self.exiting && ctx.input(|input| input.viewport().close_requested()) {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
@@ -2623,6 +2693,7 @@ fn main() -> eframe::Result {
                 .with_decorations(false)
                 .with_always_on_top()
                 .with_taskbar(false)
+                .with_mouse_passthrough(true)
                 .with_transparent(true),
             ..Default::default()
         };
