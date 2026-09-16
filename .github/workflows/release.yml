@@ -140,6 +140,7 @@ jobs:
           New-Item -ItemType Directory -Force -Path dist\portable\ResourceMonitor | Out-Null
           Copy-Item target\x86_64-pc-windows-msvc\release\resource_monitor.exe dist\portable\ResourceMonitor\ResourceMonitor.exe
           Copy-Item README.md dist\portable\ResourceMonitor\README.md
+          Copy-Item vendor\sensor-support dist\portable\ResourceMonitor\sensor-support -Recurse
           Compress-Archive -Path dist\portable\ResourceMonitor -DestinationPath "dist\ResourceMonitor-${{ needs.prepare.outputs.version }}-Windows-Portable.zip"
       - name: Build Windows installer
         shell: pwsh

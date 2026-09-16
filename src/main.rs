@@ -1,6 +1,8 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
 use std::collections::VecDeque;
+#[cfg(target_os = "windows")]
+use std::ffi::c_void;
 #[cfg(target_os = "macos")]
 use std::ffi::{c_char, c_void};
 use std::process::Command;
@@ -17,6 +19,11 @@ use eframe::egui::{
     self, Align, Align2, Color32, FontId, Layout, Margin, RichText, Sense, Stroke, StrokeKind, Vec2,
 };
 use sysinfo::{Components, Disks, Networks, ProcessesToUpdate, System};
+#[cfg(target_os = "windows")]
+use tray_icon::{
+    Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent,
+    menu::{Menu, MenuEvent, MenuId, MenuItem},
+};
 
 const BLUE: Color32 = Color32::from_rgb(92, 145, 255);
 const GREEN: Color32 = Color32::from_rgb(68, 196, 130);
@@ -188,13 +195,197 @@ impl PopupPosition {
     }
 }
 
+#[derive(Clone, Copy)]
+struct MonitorArea {
+    left: f32,
+    top: f32,
+    width: f32,
+    height: f32,
+}
+
+#[cfg(target_os = "windows")]
+#[repr(C)]
+struct WinRect {
+    left: i32,
+    top: i32,
+    right: i32,
+    bottom: i32,
+}
+
+#[cfg(target_os = "windows")]
+#[repr(C)]
+struct WinMonitorInfo {
+    size: u32,
+    monitor: WinRect,
+    work: WinRect,
+    flags: u32,
+}
+
+#[cfg(target_os = "windows")]
+#[link(name = "user32")]
+unsafe extern "system" {
+    fn EnumDisplayMonitors(
+        dc: *mut c_void,
+        clip: *const WinRect,
+        callback: unsafe extern "system" fn(*mut c_void, *mut c_void, *mut WinRect, isize) -> i32,
+        data: isize,
+    ) -> i32;
+    fn GetMonitorInfoW(monitor: *mut c_void, info: *mut WinMonitorInfo) -> i32;
+}
+
+#[cfg(target_os = "windows")]
+unsafe extern "system" fn collect_monitor(
+    monitor: *mut c_void,
+    _: *mut c_void,
+    _: *mut WinRect,
+    data: isize,
+) -> i32 {
+    let mut info = WinMonitorInfo {
+        size: std::mem::size_of::<WinMonitorInfo>() as u32,
+        monitor: WinRect {
+            left: 0,
+            top: 0,
+            right: 0,
+            bottom: 0,
+        },
+        work: WinRect {
+            left: 0,
+            top: 0,
+            right: 0,
+            bottom: 0,
+        },
+        flags: 0,
+    };
+    if unsafe { GetMonitorInfoW(monitor, &mut info) } != 0 {
+        let monitors = unsafe { &mut *(data as *mut Vec<(bool, MonitorArea)>) };
+        monitors.push((
+            info.flags & 1 != 0,
+            MonitorArea {
+                left: info.work.left as f32,
+                top: info.work.top as f32,
+                width: (info.work.right - info.work.left) as f32,
+                height: (info.work.bottom - info.work.top) as f32,
+            },
+        ));
+    }
+    1
+}
+
+fn monitor_areas(ctx: &egui::Context) -> Vec<MonitorArea> {
+    #[cfg(target_os = "windows")]
+    {
+        let mut found: Vec<(bool, MonitorArea)> = Vec::new();
+        unsafe {
+            EnumDisplayMonitors(
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                collect_monitor,
+                &mut found as *mut _ as isize,
+            );
+        }
+        found.sort_by(|a, b| {
+            b.0.cmp(&a.0)
+                .then_with(|| a.1.left.total_cmp(&b.1.left))
+                .then_with(|| a.1.top.total_cmp(&b.1.top))
+        });
+        if !found.is_empty() {
+            return found.into_iter().map(|(_, area)| area).collect();
+        }
+    }
+    let size = ctx
+        .input(|i| i.viewport().monitor_size)
+        .unwrap_or(Vec2::new(1920.0, 1080.0));
+    vec![MonitorArea {
+        left: 0.0,
+        top: 0.0,
+        width: size.x,
+        height: size.y,
+    }]
+}
+
+fn popup_screen_position(area: MonitorArea, size: Vec2, position: PopupPosition) -> [f32; 2] {
+    let margin = 18.0;
+    let top = area.top
+        + if cfg!(target_os = "macos") {
+            42.0
+        } else {
+            margin
+        };
+    let bottom = area.top + area.height - size.y - margin;
+    let left = area.left + margin;
+    let center = area.left + (area.width - size.x) / 2.0;
+    let right = area.left + area.width - size.x - margin;
+    match position {
+        PopupPosition::TopLeft => [left, top],
+        PopupPosition::TopCenter => [center, top],
+        PopupPosition::TopRight => [right, top],
+        PopupPosition::BottomLeft => [left, bottom],
+        PopupPosition::BottomCenter => [center, bottom],
+        PopupPosition::BottomRight => [right, bottom],
+    }
+}
+
 struct GpuInfo {
     name: String,
     detail: String,
     usage: f32,
     memory: u64,
+    temperature: Option<f32>,
     details_rx: Option<Receiver<String>>,
     usage_rx: Option<Receiver<String>>,
+}
+
+#[derive(Clone, Copy, Default)]
+struct HardwareTemperatures {
+    cpu: Option<f32>,
+    memory: Option<f32>,
+    disk: Option<f32>,
+}
+
+struct TemperatureMonitor {
+    values: HardwareTemperatures,
+    receiver: Option<Receiver<String>>,
+}
+
+impl TemperatureMonitor {
+    fn new() -> Self {
+        let mut monitor = Self {
+            values: HardwareTemperatures::default(),
+            receiver: None,
+        };
+        monitor.request_refresh();
+        monitor
+    }
+
+    fn poll(&mut self) {
+        let Some(receiver) = &self.receiver else {
+            return;
+        };
+        match receiver.try_recv() {
+            Ok(text) => {
+                self.values.cpu =
+                    valid_temperature(extract_number(&text, "CPU_TEMPERATURE")).or(self.values.cpu);
+                self.values.memory = valid_temperature(extract_number(&text, "MEMORY_TEMPERATURE"))
+                    .or(self.values.memory);
+                self.values.disk = valid_temperature(extract_number(&text, "DISK_TEMPERATURE"))
+                    .or(self.values.disk);
+                self.receiver = None;
+            }
+            Err(TryRecvError::Disconnected) => self.receiver = None,
+            Err(TryRecvError::Empty) => {}
+        }
+    }
+
+    fn request_refresh(&mut self) {
+        if self.receiver.is_some() {
+            return;
+        }
+        let (sender, receiver) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = sender.send(hardware_temperature_output());
+        });
+        self.receiver = Some(receiver);
+    }
 }
 
 impl GpuInfo {
@@ -208,6 +399,7 @@ impl GpuInfo {
             detail: platform().into(),
             usage: 0.0,
             memory: 0,
+            temperature: None,
             details_rx: Some(receiver),
             usage_rx: None,
         }
@@ -238,6 +430,9 @@ impl GpuInfo {
                     self.memory = extract_number(&text, "Alloc system memory")
                         .map(|value| value as u64)
                         .unwrap_or(self.memory);
+                    self.temperature = extract_number(&text, "GPU_TEMPERATURE")
+                        .filter(|value| value.is_finite() && (-20.0..=150.0).contains(value))
+                        .or(self.temperature);
                     self.usage_rx = None;
                 }
                 Err(TryRecvError::Disconnected) => self.usage_rx = None,
@@ -268,10 +463,19 @@ fn gpu_command_output(details: bool) -> String {
             .output()
     };
     #[cfg(target_os = "windows")]
-    let output = if details {
-        Command::new("powershell").args(["-NoProfile", "-Command", "Get-CimInstance Win32_VideoController | Select-Object -First 1 | ForEach-Object { 'Name=' + $_.Name }"]).output()
-    } else {
-        Command::new("powershell").args(["-NoProfile", "-Command", "$v=(Get-Counter '\\GPU Engine(*)\\Utilization Percentage' -ErrorAction SilentlyContinue).CounterSamples.CookedValue | Measure-Object -Sum; 'GPU_USAGE=' + $v.Sum"]).output()
+    let output = {
+        use std::os::windows::process::CommandExt;
+
+        let script = if details {
+            "Get-CimInstance Win32_VideoController | Select-Object -First 1 | ForEach-Object { 'Name=' + $_.Name }"
+        } else {
+            "$v=(Get-Counter '\\GPU Engine(*)\\Utilization Percentage' -ErrorAction SilentlyContinue).CounterSamples.CookedValue | Measure-Object -Sum; 'GPU_USAGE=' + $v.Sum; $t=(& nvidia-smi --query-gpu=temperature.gpu --format=csv,noheader,nounits 2>$null | Select-Object -First 1); if ($t) { 'GPU_TEMPERATURE=' + $t }"
+        };
+
+        Command::new("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-Command", script])
+            .creation_flags(0x08000000)
+            .output()
     };
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     let output = Command::new("sh").args(["-c", "true"]).output();
@@ -279,6 +483,60 @@ fn gpu_command_output(details: bool) -> String {
         .ok()
         .map(|value| String::from_utf8_lossy(&value.stdout).into_owned())
         .unwrap_or_default()
+}
+
+fn valid_temperature(value: Option<f32>) -> Option<f32> {
+    value.filter(|value| value.is_finite() && (1.0..=150.0).contains(value))
+}
+
+#[cfg(target_os = "windows")]
+fn hardware_temperature_output() -> String {
+    use std::os::windows::process::CommandExt;
+
+    let Some(helper) = windows_sensor_helper() else {
+        return String::new();
+    };
+    Command::new(helper)
+        .creation_flags(0x08000000)
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
+        .unwrap_or_default()
+}
+
+#[cfg(not(target_os = "windows"))]
+fn hardware_temperature_output() -> String {
+    String::new()
+}
+
+#[cfg(target_os = "windows")]
+fn windows_sensor_helper() -> Option<std::path::PathBuf> {
+    windows_sensor_support_file("ResourceMonitorSensors.exe")
+}
+
+#[cfg(target_os = "windows")]
+fn windows_sensor_support_file(name: &str) -> Option<std::path::PathBuf> {
+    let executable_directory = std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(std::path::Path::to_path_buf));
+    let manifest_directory = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let roots = executable_directory
+        .into_iter()
+        .chain(std::iter::once(manifest_directory));
+
+    for root in roots {
+        let packaged = root.join("sensor-support").join(name);
+        if packaged.is_file() {
+            return Some(packaged);
+        }
+
+        let development = root.join("vendor/sensor-support").join(name);
+        if development.is_file() {
+            return Some(development);
+        }
+    }
+    None
 }
 
 fn extract_after(text: &str, key: &str) -> Option<String> {
@@ -303,6 +561,7 @@ fn extract_number(text: &str, key: &str) -> Option<f32> {
 struct App {
     sys: System,
     components: Components,
+    temperature_monitor: TemperatureMonitor,
     gpu: GpuInfo,
     disks: Disks,
     networks: Networks,
@@ -322,6 +581,7 @@ struct App {
     popup_closed: Arc<AtomicBool>,
     exiting: bool,
     popup_position: PopupPosition,
+    popup_monitor: usize,
     popup_cpu: bool,
     popup_gpu: bool,
     popup_memory: bool,
@@ -343,6 +603,15 @@ struct App {
     update_download_rx: Option<Receiver<Result<std::path::PathBuf, String>>>,
     downloaded_update: Option<std::path::PathBuf>,
     update_download_error: Option<String>,
+    #[cfg(target_os = "windows")]
+    tray: Option<TrayState>,
+}
+
+#[cfg(target_os = "windows")]
+struct TrayState {
+    _icon: TrayIcon,
+    open_id: MenuId,
+    quit_id: MenuId,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -357,6 +626,7 @@ struct SavedSettings {
     dark: bool,
     popup: bool,
     popup_position: PopupPosition,
+    popup_monitor: usize,
     popup_cpu: bool,
     popup_gpu: bool,
     popup_memory: bool,
@@ -375,6 +645,7 @@ impl SavedSettings {
             dark,
             popup: false,
             popup_position: PopupPosition::TopRight,
+            popup_monitor: 0,
             popup_cpu: true,
             popup_gpu: false,
             popup_memory: true,
@@ -412,6 +683,7 @@ impl SavedSettings {
                         .map(PopupPosition::from_code)
                         .unwrap_or(self.popup_position)
                 }
+                "popup_monitor" => self.popup_monitor = value.parse().unwrap_or(self.popup_monitor),
                 "popup_cpu" => self.popup_cpu = parse_bool(value).unwrap_or(self.popup_cpu),
                 "popup_gpu" => self.popup_gpu = parse_bool(value).unwrap_or(self.popup_gpu),
                 "popup_memory" => {
@@ -459,6 +731,7 @@ impl SavedSettings {
                 "dark={}\n",
                 "popup={}\n",
                 "popup_position={}\n",
+                "popup_monitor={}\n",
                 "popup_cpu={}\n",
                 "popup_gpu={}\n",
                 "popup_memory={}\n",
@@ -473,6 +746,7 @@ impl SavedSettings {
             u8::from(self.dark),
             u8::from(self.popup),
             self.popup_position.code(),
+            self.popup_monitor,
             u8::from(self.popup_cpu),
             u8::from(self.popup_gpu),
             u8::from(self.popup_memory),
@@ -503,9 +777,12 @@ impl App {
         set_style(&cc.egui_ctx, dark);
         let saved_settings = settings.encode();
         let update_rx = Some(start_update_check(cc.egui_ctx.clone()));
+        #[cfg(target_os = "windows")]
+        let tray = create_tray_icon();
         let mut app = Self {
             sys: System::new(),
             components: Components::new_with_refreshed_list(),
+            temperature_monitor: TemperatureMonitor::new(),
             gpu: GpuInfo::new(),
             disks: Disks::new_with_refreshed_list(),
             networks: Networks::new_with_refreshed_list(),
@@ -525,6 +802,7 @@ impl App {
             popup_closed: Arc::new(AtomicBool::new(false)),
             exiting: false,
             popup_position: settings.popup_position,
+            popup_monitor: settings.popup_monitor,
             popup_cpu: settings.popup_cpu,
             popup_gpu: settings.popup_gpu,
             popup_memory: settings.popup_memory,
@@ -546,6 +824,8 @@ impl App {
             update_download_rx: None,
             downloaded_update: None,
             update_download_error: None,
+            #[cfg(target_os = "windows")]
+            tray,
         };
         app.refresh();
         app
@@ -556,6 +836,7 @@ impl App {
             dark: self.dark,
             popup: self.popup,
             popup_position: self.popup_position,
+            popup_monitor: self.popup_monitor,
             popup_cpu: self.popup_cpu,
             popup_gpu: self.popup_gpu,
             popup_memory: self.popup_memory,
@@ -630,8 +911,10 @@ impl App {
     fn refresh(&mut self) {
         self.sys.refresh_cpu_usage();
         self.sys.refresh_memory();
+        self.temperature_monitor.poll();
         if self.last_temperature_refresh.elapsed() >= Duration::from_secs(10) {
             self.components.refresh(true);
+            self.temperature_monitor.request_refresh();
             self.last_temperature_refresh = Instant::now();
         }
         let popup_visible = self.popup;
@@ -810,8 +1093,22 @@ impl App {
                     ui.end_row();
                     pair(
                         ui,
-                        tr(self.language, "temperatures"),
-                        &sensor_summary(&self.components),
+                        &format!("CPU {}", tr(self.language, "temperature")),
+                        &temperature_value(
+                            self.temperature_monitor
+                                .values
+                                .cpu
+                                .or_else(|| temperature_for(&self.components, "cpu")),
+                        ),
+                    );
+                    pair(
+                        ui,
+                        &format!("GPU {}", tr(self.language, "temperature")),
+                        &temperature_value(
+                            self.gpu
+                                .temperature
+                                .or_else(|| temperature_for(&self.components, "gpu")),
+                        ),
                     );
                     ui.end_row();
                 });
@@ -829,9 +1126,17 @@ impl App {
             ui,
             tr(self.language, "processor"),
             brand,
-            &temperature_text(temperature_for(&self.components, "cpu"))
-                .map(|temperature| format!("{:.1}%  •  {temperature}", self.sys.global_cpu_usage()))
-                .unwrap_or_else(|| format!("{:.1}%", self.sys.global_cpu_usage())),
+            &format!(
+                "{:.1}%  •  {}: {}",
+                self.sys.global_cpu_usage(),
+                tr(self.language, "temperature"),
+                temperature_value(
+                    self.temperature_monitor
+                        .values
+                        .cpu
+                        .or_else(|| temperature_for(&self.components, "cpu"))
+                )
+            ),
             BLUE,
         );
         ui.add_space(14.0);
@@ -869,9 +1174,16 @@ impl App {
             ui,
             tr(self.language, "graphics_processor"),
             &format!("{} • {}", self.gpu.name, self.gpu.detail),
-            &temperature_text(temperature_for(&self.components, "gpu"))
-                .map(|temperature| format!("{:.1}%  •  {temperature}", self.gpu.usage))
-                .unwrap_or_else(|| format!("{:.1}%", self.gpu.usage)),
+            &format!(
+                "{:.1}%  •  {}: {}",
+                self.gpu.usage,
+                tr(self.language, "temperature"),
+                temperature_value(
+                    self.gpu
+                        .temperature
+                        .or_else(|| temperature_for(&self.components, "gpu"))
+                )
+            ),
             GREEN,
         );
         ui.add_space(14.0);
@@ -906,9 +1218,16 @@ impl App {
             ui,
             tr(self.language, "physical_memory"),
             &format!("{} total", bytes(self.sys.total_memory())),
-            &temperature_text(temperature_for(&self.components, "memory"))
-                .map(|temperature| format!("{usage:.1}%  •  {temperature}"))
-                .unwrap_or_else(|| format!("{usage:.1}%")),
+            &format!(
+                "{usage:.1}%  •  {}: {}",
+                tr(self.language, "temperature"),
+                temperature_value(
+                    self.temperature_monitor
+                        .values
+                        .memory
+                        .or_else(|| temperature_for(&self.components, "memory"))
+                )
+            ),
             PURPLE,
         );
         ui.add_space(14.0);
@@ -959,15 +1278,19 @@ impl App {
                 ))
                 .weak(),
             );
-            if let Some(temperature) = temperature_text(temperature_for(&self.components, "disk")) {
-                ui.label(
-                    RichText::new(format!(
-                        "• {}: {temperature}",
-                        tr(self.language, "temperature")
-                    ))
-                    .color(ORANGE),
-                );
-            }
+            ui.label(
+                RichText::new(format!(
+                    "• {}: {}",
+                    tr(self.language, "temperature"),
+                    temperature_value(
+                        self.temperature_monitor
+                            .values
+                            .disk
+                            .or_else(|| temperature_for(&self.components, "disk"))
+                    )
+                ))
+                .color(ORANGE),
+            );
         });
         ui.add_space(10.0);
         for d in &self.disks {
@@ -1169,6 +1492,32 @@ impl App {
                         .size(15.0),
                 );
                 ui.add_space(10.0);
+                let monitors = monitor_areas(ui.ctx());
+                self.popup_monitor = self.popup_monitor.min(monitors.len().saturating_sub(1));
+                if monitors.len() > 1 {
+                    egui::ComboBox::from_id_salt("popup_monitor")
+                        .selected_text(format!(
+                            "{} {}",
+                            tr(lang, "monitor"),
+                            self.popup_monitor + 1
+                        ))
+                        .show_ui(ui, |ui| {
+                            for (index, monitor) in monitors.iter().enumerate() {
+                                ui.selectable_value(
+                                    &mut self.popup_monitor,
+                                    index,
+                                    format!(
+                                        "{} {} ({}×{})",
+                                        tr(lang, "monitor"),
+                                        index + 1,
+                                        monitor.width as i32,
+                                        monitor.height as i32
+                                    ),
+                                );
+                            }
+                        });
+                    ui.add_space(10.0);
+                }
                 egui::Grid::new("popup_positions")
                     .num_columns(3)
                     .spacing([18.0, 10.0])
@@ -1237,9 +1586,6 @@ impl App {
         if !self.popup {
             return;
         }
-        let monitor = ctx
-            .input(|i| i.viewport().monitor_size)
-            .unwrap_or(Vec2::new(1920.0, 1080.0));
         let width = 292.0;
         let shown = [
             self.popup_cpu,
@@ -1250,7 +1596,11 @@ impl App {
             self.popup_network,
         ];
         let count = shown.into_iter().filter(|shown| *shown).count().max(1);
-        let temperatures = metric_temperatures(&self.components);
+        let mut temperatures = metric_temperatures(&self.components);
+        temperatures[0] = self.temperature_monitor.values.cpu.or(temperatures[0]);
+        temperatures[1] = self.gpu.temperature.or(temperatures[1]);
+        temperatures[2] = self.temperature_monitor.values.memory.or(temperatures[2]);
+        temperatures[3] = self.temperature_monitor.values.disk.or(temperatures[3]);
         let graph_count = [0, 1, 2, 5]
             .into_iter()
             .filter(|index| shown[*index])
@@ -1261,29 +1611,13 @@ impl App {
             0
         };
         let height = 48.0 + count as f32 * 31.0 + graph_rows as f32 * 76.0;
-        let margin = 18.0;
-        let top = if cfg!(target_os = "macos") {
-            42.0
-        } else {
-            margin
-        };
-        let bottom = monitor.y
-            - height
-            - if cfg!(target_os = "windows") {
-                58.0
-            } else {
-                margin
-            };
-        let center = (monitor.x - width) / 2.0;
-        let right = monitor.x - width - margin;
-        let position = match self.popup_position {
-            PopupPosition::TopLeft => [margin, top],
-            PopupPosition::TopCenter => [center, top],
-            PopupPosition::TopRight => [right, top],
-            PopupPosition::BottomLeft => [margin, bottom],
-            PopupPosition::BottomCenter => [center, bottom],
-            PopupPosition::BottomRight => [right, bottom],
-        };
+        let monitors = monitor_areas(ctx);
+        self.popup_monitor = self.popup_monitor.min(monitors.len().saturating_sub(1));
+        let position = popup_screen_position(
+            monitors[self.popup_monitor],
+            Vec2::new(width, height),
+            self.popup_position,
+        );
         let disk_total: u64 = self.disks.iter().map(|d| d.total_space()).sum();
         let disk_used: u64 = self
             .disks
@@ -1334,18 +1668,14 @@ impl App {
             egui::ViewportId::from_hash_of("monitor_popup"),
             builder,
             move |ui, _| {
+                set_windows_popup_opacity(opacity);
                 egui::CentralPanel::default()
                     .frame(
                         egui::Frame::new()
                             .fill(if dark {
-                                Color32::from_rgba_unmultiplied(25, 27, 32, (opacity * 255.0) as u8)
+                                popup_background(25, 27, 32, opacity)
                             } else {
-                                Color32::from_rgba_unmultiplied(
-                                    248,
-                                    249,
-                                    251,
-                                    (opacity * 255.0) as u8,
-                                )
+                                popup_background(248, 249, 251, opacity)
                             })
                             .corner_radius(if cfg!(target_os = "macos") { 12 } else { 4 })
                             .inner_margin(Margin::same(14)),
@@ -1415,6 +1745,93 @@ impl App {
         // 값 또는 설정이 갱신되면 다음 주기까지 기다리지 않고 팝업에 반영합니다.
         ctx.request_repaint_of(egui::ViewportId::from_hash_of("monitor_popup"));
     }
+
+    #[cfg(target_os = "windows")]
+    fn handle_tray_events(&mut self, ctx: &egui::Context) {
+        let Some(tray) = &self.tray else {
+            return;
+        };
+        let mut show = false;
+        let mut quit = false;
+
+        while let Ok(event) = MenuEvent::receiver().try_recv() {
+            if event.id == tray.open_id {
+                show = true;
+            } else if event.id == tray.quit_id {
+                quit = true;
+            }
+        }
+        while let Ok(event) = TrayIconEvent::receiver().try_recv() {
+            if matches!(
+                event,
+                TrayIconEvent::Click {
+                    button: MouseButton::Left,
+                    button_state: MouseButtonState::Up,
+                    ..
+                } | TrayIconEvent::DoubleClick {
+                    button: MouseButton::Left,
+                    ..
+                }
+            ) {
+                show = true;
+            }
+        }
+        if show {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        }
+        if quit {
+            self.exiting = true;
+            self.popup = false;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn create_tray_icon() -> Option<TrayState> {
+    let menu = Menu::new();
+    let open = MenuItem::new("Resource Monitor 열기", true, None);
+    let quit = MenuItem::new("프로그램 종료", true, None);
+    menu.append_items(&[&open, &quit]).ok()?;
+
+    let icon = TrayIconBuilder::new()
+        .with_tooltip("Resource Monitor")
+        .with_icon(resource_monitor_tray_icon()?)
+        .with_menu(Box::new(menu))
+        .with_menu_on_left_click(false)
+        .build()
+        .ok()?;
+    Some(TrayState {
+        _icon: icon,
+        open_id: open.id().clone(),
+        quit_id: quit.id().clone(),
+    })
+}
+
+#[cfg(target_os = "windows")]
+fn resource_monitor_tray_icon() -> Option<Icon> {
+    const SIZE: u32 = 32;
+    let mut rgba = vec![0_u8; (SIZE * SIZE * 4) as usize];
+    for y in 0..SIZE {
+        for x in 0..SIZE {
+            let offset = ((y * SIZE + x) * 4) as usize;
+            let dx = x as i32 - 16;
+            let dy = y as i32 - 16;
+            if dx * dx + dy * dy <= 15 * 15 {
+                rgba[offset..offset + 4].copy_from_slice(&[55, 125, 245, 255]);
+            }
+            let graph = matches!(x, 7..=9) && y >= 17
+                || matches!(x, 12..=14) && y >= 11
+                || matches!(x, 17..=19) && y >= 14
+                || matches!(x, 22..=24) && y >= 7;
+            if graph && y <= 24 {
+                rgba[offset..offset + 4].copy_from_slice(&[255, 255, 255, 255]);
+            }
+        }
+    }
+    Icon::from_rgba(rgba, SIZE, SIZE).ok()
 }
 
 impl eframe::App for App {
@@ -1425,19 +1842,25 @@ impl eframe::App for App {
             ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
             ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
         }
+        #[cfg(target_os = "windows")]
+        self.handle_tray_events(ctx);
         self.poll_update_check(ctx);
         self.poll_update_download();
-        ctx.request_repaint_after(Duration::from_secs(self.refresh_secs));
+        ctx.request_repaint_after(if cfg!(target_os = "windows") {
+            Duration::from_millis(250)
+        } else {
+            Duration::from_secs(self.refresh_secs)
+        });
     }
 
     fn ui(&mut self, root: &mut egui::Ui, _: &mut eframe::Frame) {
         let ctx = root.ctx().clone();
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
         if !self.exiting && ctx.input(|input| input.viewport().close_requested()) {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         if self.popup && !self.exiting && ctx.input(|input| input.viewport().close_requested()) {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
@@ -1631,6 +2054,7 @@ impl eframe::App for App {
 struct PopupConfig {
     opacity: f32,
     position: PopupPosition,
+    monitor: usize,
     shown: [bool; 6],
     graphs: bool,
     language: Language,
@@ -1648,18 +2072,26 @@ impl PopupConfig {
         for (slot, value) in shown.iter_mut().zip(flags.bytes()) {
             *slot = value == b'1';
         }
+        let language = Language::from_code(parts.next()?.parse().ok()?);
+        let dark = parts.next()?.parse::<u8>().ok()? != 0;
+        let refresh_secs = parts
+            .next()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(2)
+            .clamp(1, 10);
+        let monitor = parts
+            .next()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0);
         Some(Self {
             opacity,
             position,
+            monitor,
             shown,
             graphs: flags.as_bytes().get(6) == Some(&b'1'),
-            language: Language::from_code(parts.next()?.parse().ok()?),
-            dark: parts.next()?.parse::<u8>().ok()? != 0,
-            refresh_secs: parts
-                .next()
-                .and_then(|value| value.parse().ok())
-                .unwrap_or(2)
-                .clamp(1, 10),
+            language,
+            dark,
+            refresh_secs,
         })
     }
 
@@ -1682,6 +2114,7 @@ struct PopupApp {
     config: PopupConfig,
     sys: System,
     components: Components,
+    temperature_monitor: TemperatureMonitor,
     gpu: GpuInfo,
     disks: Disks,
     networks: Networks,
@@ -1701,6 +2134,7 @@ impl PopupApp {
             config,
             sys: System::new_all(),
             components: Components::new_with_refreshed_list(),
+            temperature_monitor: TemperatureMonitor::new(),
             gpu: GpuInfo::new(),
             disks: Disks::new_with_refreshed_list(),
             networks: Networks::new_with_refreshed_list(),
@@ -1736,8 +2170,10 @@ impl PopupApp {
     fn refresh(&mut self) {
         self.sys.refresh_cpu_usage();
         self.sys.refresh_memory();
+        self.temperature_monitor.poll();
         if self.last_temperature_refresh.elapsed() >= Duration::from_secs(10) {
             self.components.refresh(true);
+            self.temperature_monitor.request_refresh();
             self.last_temperature_refresh = Instant::now();
             self.layout_dirty = true;
         }
@@ -1777,34 +2213,15 @@ impl eframe::App for PopupApp {
         if self.last.elapsed() >= Duration::from_secs(self.config.refresh_secs) {
             self.refresh();
         }
-        let monitor = ctx
-            .input(|i| i.viewport().monitor_size)
-            .unwrap_or(Vec2::new(1920.0, 1080.0));
-        let temperatures = metric_temperatures(&self.components);
+        let mut temperatures = metric_temperatures(&self.components);
+        temperatures[0] = self.temperature_monitor.values.cpu.or(temperatures[0]);
+        temperatures[1] = self.gpu.temperature.or(temperatures[1]);
+        temperatures[2] = self.temperature_monitor.values.memory.or(temperatures[2]);
+        temperatures[3] = self.temperature_monitor.values.disk.or(temperatures[3]);
         let size = Vec2::new(292.0, self.config.window_height(false));
-        let margin = 18.0;
-        let center = (monitor.x - size.x) / 2.0;
-        let right = monitor.x - size.x - margin;
-        let top = if cfg!(target_os = "macos") {
-            42.0
-        } else {
-            margin
-        };
-        let bottom = monitor.y
-            - size.y
-            - if cfg!(target_os = "windows") {
-                58.0
-            } else {
-                margin
-            };
-        let pos = match self.config.position {
-            PopupPosition::TopLeft => [margin, top],
-            PopupPosition::TopCenter => [center, top],
-            PopupPosition::TopRight => [right, top],
-            PopupPosition::BottomLeft => [margin, bottom],
-            PopupPosition::BottomCenter => [center, bottom],
-            PopupPosition::BottomRight => [right, bottom],
-        };
+        let monitors = monitor_areas(&ctx);
+        let monitor = self.config.monitor.min(monitors.len().saturating_sub(1));
+        let pos = popup_screen_position(monitors[monitor], size, self.config.position);
         if self.layout_dirty {
             ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(Vec2::new(
                 292.0,
@@ -1820,14 +2237,14 @@ impl eframe::App for PopupApp {
             .iter()
             .map(|(_, n)| n.transmitted())
             .sum::<u64>();
-        let alpha = (self.config.opacity * 255.0) as u8;
+        set_windows_popup_opacity(self.config.opacity);
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::new()
                     .fill(if self.config.dark {
-                        Color32::from_rgba_unmultiplied(25, 27, 32, alpha)
+                        popup_background(25, 27, 32, self.config.opacity)
                     } else {
-                        Color32::from_rgba_unmultiplied(248, 249, 251, alpha)
+                        popup_background(248, 249, 251, self.config.opacity)
                     })
                     .corner_radius(if cfg!(target_os = "macos") { 12 } else { 4 })
                     .inner_margin(Margin::same(14)),
@@ -2105,6 +2522,7 @@ mod settings_tests {
             dark: false,
             popup: true,
             popup_position: PopupPosition::BottomCenter,
+            popup_monitor: 1,
             popup_cpu: false,
             popup_gpu: true,
             popup_memory: false,
@@ -2188,13 +2606,10 @@ fn autostart_enabled() -> bool {
     }
     #[cfg(target_os = "windows")]
     {
-        return Command::new("reg")
-            .args([
-                "query",
-                r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run",
-                "/v",
-                "ResourceMonitor",
-            ])
+        use std::os::windows::process::CommandExt;
+        return Command::new("schtasks")
+            .args(["/Query", "/TN", "ResourceMonitor"])
+            .creation_flags(0x08000000)
             .output()
             .is_ok_and(|o| o.status.success());
     }
@@ -2232,24 +2647,28 @@ fn set_autostart(enabled: bool) -> Result<(), String> {
     }
     #[cfg(target_os = "windows")]
     {
-        let key = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
+        use std::os::windows::process::CommandExt;
         let status = if enabled {
-            Command::new("reg")
+            let task_command = format!("\"{}\" --background", exe.display());
+            Command::new("schtasks")
                 .args([
-                    "add",
-                    key,
-                    "/v",
+                    "/Create",
+                    "/TN",
                     "ResourceMonitor",
-                    "/t",
-                    "REG_SZ",
-                    "/d",
-                    &exe.display().to_string(),
-                    "/f",
+                    "/SC",
+                    "ONLOGON",
+                    "/RL",
+                    "HIGHEST",
+                    "/TR",
+                    &task_command,
+                    "/F",
                 ])
+                .creation_flags(0x08000000)
                 .status()
         } else {
-            Command::new("reg")
-                .args(["delete", key, "/v", "ResourceMonitor", "/f"])
+            Command::new("schtasks")
+                .args(["/Delete", "/TN", "ResourceMonitor", "/F"])
+                .creation_flags(0x08000000)
                 .status()
         }
         .map_err(|e| e.to_string())?;
@@ -2647,6 +3066,55 @@ fn temperature_for(components: &Components, category: &str) -> Option<f32> {
 fn temperature_text(value: Option<f32>) -> Option<String> {
     value.map(|temperature| format!("{temperature:.0} °C"))
 }
+
+fn popup_background(red: u8, green: u8, blue: u8, opacity: f32) -> Color32 {
+    if cfg!(target_os = "windows") {
+        Color32::from_rgb(red, green, blue)
+    } else {
+        Color32::from_rgba_unmultiplied(red, green, blue, (opacity * 255.0) as u8)
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn set_windows_popup_opacity(opacity: f32) {
+    use std::ffi::c_void;
+
+    type Hwnd = *mut c_void;
+    const GWL_EXSTYLE: i32 = -20;
+    const WS_EX_LAYERED: i32 = 0x0008_0000;
+    const LWA_ALPHA: u32 = 0x0000_0002;
+
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn FindWindowW(class_name: *const u16, window_name: *const u16) -> Hwnd;
+        fn GetWindowLongW(window: Hwnd, index: i32) -> i32;
+        fn SetWindowLongW(window: Hwnd, index: i32, value: i32) -> i32;
+        fn SetLayeredWindowAttributes(window: Hwnd, color_key: u32, alpha: u8, flags: u32) -> i32;
+    }
+
+    let title: Vec<u16> = "Resource Monitor Popup\0".encode_utf16().collect();
+    unsafe {
+        let window = FindWindowW(std::ptr::null(), title.as_ptr());
+        if !window.is_null() {
+            let style = GetWindowLongW(window, GWL_EXSTYLE);
+            if style & WS_EX_LAYERED == 0 {
+                SetWindowLongW(window, GWL_EXSTYLE, style | WS_EX_LAYERED);
+            }
+            SetLayeredWindowAttributes(
+                window,
+                0,
+                (opacity.clamp(0.0, 1.0) * 255.0).round() as u8,
+                LWA_ALPHA,
+            );
+        }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn set_windows_popup_opacity(_: f32) {}
+fn temperature_value(value: Option<f32>) -> String {
+    temperature_text(value).unwrap_or_else(|| "—".to_owned())
+}
 fn metric_temperatures(components: &Components) -> [Option<f32>; 6] {
     [
         temperature_for(components, "cpu"),
@@ -2656,22 +3124,6 @@ fn metric_temperatures(components: &Components) -> [Option<f32>; 6] {
         None,
         None,
     ]
-}
-fn sensor_summary(components: &Components) -> String {
-    let values: Vec<_> = components
-        .iter()
-        .filter_map(|component| {
-            let temperature = component.temperature()?;
-            (temperature.is_finite() && (-20.0..=150.0).contains(&temperature))
-                .then(|| format!("{}: {temperature:.0} °C", component.label()))
-        })
-        .take(6)
-        .collect();
-    if values.is_empty() {
-        "—".to_owned()
-    } else {
-        values.join("  •  ")
-    }
 }
 fn uptime(s: u64) -> String {
     let d = s / 86400;
@@ -2735,6 +3187,8 @@ fn tr<'a>(lang: Language, key: &'a str) -> &'a str {
         (Language::Japanese, "network_speed") => "ネットワーク速度",
         (Language::Korean, "screen_position") => "화면 위치",
         (Language::Japanese, "screen_position") => "画面位置",
+        (Language::Korean, "monitor") => "모니터",
+        (Language::Japanese, "monitor") => "モニター",
         (Language::Korean, "opacity") => "팝업 투명도",
         (Language::Japanese, "opacity") => "ポップアップの透明度",
         (Language::Korean, "top_left") => "왼쪽 상단",
@@ -2874,6 +3328,7 @@ fn tr<'a>(lang: Language, key: &'a str) -> &'a str {
         (_, "process_count") => "Process count",
         (_, "network_speed") => "Network speed",
         (_, "screen_position") => "Screen position",
+        (_, "monitor") => "Monitor",
         (_, "opacity") => "Popup opacity",
         (_, "top_left") => "Top left",
         (_, "top_center") => "Top center",
@@ -2949,6 +3404,12 @@ fn refresh_label(language: Language, seconds: u64) -> String {
 
 fn main() -> eframe::Result {
     let args: Vec<String> = std::env::args().collect();
+    #[cfg(target_os = "windows")]
+    if !ensure_windows_elevated(&args) {
+        return Ok(());
+    }
+    #[cfg(target_os = "windows")]
+    ensure_pawnio_installed();
     if args.get(1).is_some_and(|arg| arg == "--popup") {
         let opacity = args.get(2).and_then(|v| v.parse().ok()).unwrap_or(0.92);
         let position =
@@ -2966,12 +3427,14 @@ fn main() -> eframe::Result {
             .and_then(|v| v.parse().ok())
             .unwrap_or(2)
             .clamp(1, 10);
+        let monitor = args.get(8).and_then(|v| v.parse().ok()).unwrap_or(0);
         let count = shown.into_iter().filter(|v| *v).count().max(1);
         let rows = if graphs { (count + 1) / 2 } else { 0 };
         let height = 48.0 + count as f32 * 31.0 + rows as f32 * 76.0;
         let config = PopupConfig {
             opacity,
             position,
+            monitor,
             shown,
             graphs,
             language,
@@ -2997,10 +3460,12 @@ fn main() -> eframe::Result {
             Box::new(move |cc| Ok(Box::new(PopupApp::new(cc, config)))),
         );
     }
+    let start_in_background = args.iter().any(|argument| argument == "--background");
     let viewport = egui::ViewportBuilder::default()
         .with_title("Resource Monitor")
         .with_inner_size([1180.0, 760.0])
         .with_min_inner_size([900.0, 620.0])
+        .with_visible(!start_in_background)
         .with_transparent(true);
     #[cfg(target_os = "macos")]
     let viewport = viewport
@@ -3021,6 +3486,72 @@ fn main() -> eframe::Result {
         options,
         Box::new(|cc| Ok(Box::new(App::new(cc)))),
     )
+}
+
+#[cfg(target_os = "windows")]
+fn ensure_windows_elevated(args: &[String]) -> bool {
+    use std::ffi::c_void;
+    use std::os::windows::ffi::OsStrExt;
+
+    #[link(name = "shell32")]
+    unsafe extern "system" {
+        fn IsUserAnAdmin() -> i32;
+        fn ShellExecuteW(
+            window: *mut c_void,
+            operation: *const u16,
+            file: *const u16,
+            parameters: *const u16,
+            directory: *const u16,
+            show_command: i32,
+        ) -> *mut c_void;
+    }
+
+    if unsafe { IsUserAnAdmin() } != 0 {
+        return true;
+    }
+    let Ok(executable) = std::env::current_exe() else {
+        return true;
+    };
+    let operation: Vec<u16> = "runas\0".encode_utf16().collect();
+    let file: Vec<u16> = executable
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let parameters = args
+        .iter()
+        .skip(1)
+        .map(|argument| format!("\"{}\"", argument.replace('"', "\\\"")))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let parameters: Vec<u16> = parameters
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    let result = unsafe {
+        ShellExecuteW(
+            std::ptr::null_mut(),
+            operation.as_ptr(),
+            file.as_ptr(),
+            parameters.as_ptr(),
+            std::ptr::null(),
+            1,
+        )
+    } as isize;
+    result <= 32
+}
+
+#[cfg(target_os = "windows")]
+fn ensure_pawnio_installed() {
+    let installed = std::env::var_os("ProgramFiles")
+        .map(std::path::PathBuf::from)
+        .is_some_and(|path| path.join("PawnIO/PawnIOLib.dll").is_file());
+    if installed {
+        return;
+    }
+    if let Some(installer) = windows_sensor_support_file("PawnIO_setup.exe") {
+        let _ = Command::new(installer).status();
+    }
 }
 
 #[cfg(target_os = "windows")]

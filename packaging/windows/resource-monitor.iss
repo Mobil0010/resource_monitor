@@ -34,6 +34,7 @@ Name: "desktopicon"; Description: "바탕 화면에 바로 가기 만들기"; Gr
 
 [Files]
 Source: "{#SourceExe}"; DestDir: "{app}"; DestName: "ResourceMonitor.exe"; Flags: ignoreversion
+Source: "..\..\vendor\sensor-support\*"; DestDir: "{app}\sensor-support"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
 Name: "{autoprograms}\Resource Monitor"; Filename: "{app}\ResourceMonitor.exe"
