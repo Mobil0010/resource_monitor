@@ -8,6 +8,8 @@ use std::ffi::{c_char, c_void};
 use std::process::Command;
 #[cfg(target_os = "macos")]
 use std::sync::OnceLock;
+#[cfg(target_os = "windows")]
+use std::sync::atomic::{AtomicIsize, AtomicPtr};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::{
     Arc,
@@ -37,6 +39,10 @@ const RELEASE_API: &str = "https://api.github.com/repos/Mobil0010/resource_monit
 static MAC_REOPEN_REQUESTED: AtomicBool = AtomicBool::new(false);
 #[cfg(target_os = "macos")]
 static MAC_EGUI_CONTEXT: OnceLock<egui::Context> = OnceLock::new();
+#[cfg(target_os = "windows")]
+static POPUP_SUBCLASSED_WINDOW: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
+#[cfg(target_os = "windows")]
+static POPUP_ORIGINAL_WINDOW_PROC: AtomicIsize = AtomicIsize::new(0);
 
 #[cfg(target_os = "macos")]
 #[link(name = "objc")]
@@ -195,6 +201,47 @@ impl PopupPosition {
     }
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum PopupSize {
+    Small,
+    Medium,
+    Large,
+}
+
+impl PopupSize {
+    const ALL: [Self; 3] = [Self::Small, Self::Medium, Self::Large];
+
+    fn key(self) -> &'static str {
+        match self {
+            Self::Small => "small",
+            Self::Medium => "medium",
+            Self::Large => "large",
+        }
+    }
+
+    fn scale(self) -> f32 {
+        match self {
+            Self::Small => 0.82,
+            Self::Medium => 1.0,
+            Self::Large => 1.22,
+        }
+    }
+
+    fn from_code(code: u8) -> Self {
+        Self::ALL
+            .get(code as usize)
+            .copied()
+            .unwrap_or(Self::Medium)
+    }
+
+    fn code(self) -> u8 {
+        Self::ALL
+            .iter()
+            .position(|value| *value == self)
+            .unwrap_or(1) as u8
+    }
+}
+
 #[derive(Clone, Copy)]
 struct MonitorArea {
     left: f32,
@@ -231,6 +278,48 @@ unsafe extern "system" {
         data: isize,
     ) -> i32;
     fn GetMonitorInfoW(monitor: *mut c_void, info: *mut WinMonitorInfo) -> i32;
+    fn FindWindowW(class_name: *const u16, window_name: *const u16) -> *mut c_void;
+    fn GetWindowRect(window: *mut c_void, rect: *mut WinRect) -> i32;
+    fn GetWindowLongW(window: *mut c_void, index: i32) -> i32;
+    fn SetWindowLongW(window: *mut c_void, index: i32, value: i32) -> i32;
+    fn SetWindowLongPtrW(window: *mut c_void, index: i32, value: isize) -> isize;
+    fn CallWindowProcW(
+        previous: isize,
+        window: *mut c_void,
+        message: u32,
+        wparam: usize,
+        lparam: isize,
+    ) -> isize;
+    fn DefWindowProcW(window: *mut c_void, message: u32, wparam: usize, lparam: isize) -> isize;
+    fn SetWindowPos(
+        window: *mut c_void,
+        insert_after: *mut c_void,
+        x: i32,
+        y: i32,
+        width: i32,
+        height: i32,
+        flags: u32,
+    ) -> i32;
+}
+
+#[cfg(target_os = "windows")]
+unsafe extern "system" fn popup_window_proc(
+    window: *mut c_void,
+    message: u32,
+    wparam: usize,
+    lparam: isize,
+) -> isize {
+    const WM_NCHITTEST: u32 = 0x0084;
+    const HTTRANSPARENT: isize = -1;
+    if message == WM_NCHITTEST {
+        return HTTRANSPARENT;
+    }
+    let previous = POPUP_ORIGINAL_WINDOW_PROC.load(Ordering::Relaxed);
+    if previous == 0 {
+        unsafe { DefWindowProcW(window, message, wparam, lparam) }
+    } else {
+        unsafe { CallWindowProcW(previous, window, message, wparam, lparam) }
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -324,6 +413,69 @@ fn popup_screen_position(area: MonitorArea, size: Vec2, position: PopupPosition)
         PopupPosition::BottomRight => [right, bottom],
     }
 }
+
+#[cfg(target_os = "windows")]
+fn set_windows_popup_position(area: MonitorArea, position: PopupPosition) {
+    const SWP_NOSIZE: u32 = 0x0001;
+    const SWP_NOZORDER: u32 = 0x0004;
+    const SWP_NOACTIVATE: u32 = 0x0010;
+    let title: Vec<u16> = "Resource Monitor Popup\0".encode_utf16().collect();
+    unsafe {
+        let window = FindWindowW(std::ptr::null(), title.as_ptr());
+        let mut rect = WinRect {
+            left: 0,
+            top: 0,
+            right: 0,
+            bottom: 0,
+        };
+        if window.is_null() || GetWindowRect(window, &mut rect) == 0 {
+            return;
+        }
+        // winit couples mouse passthrough with WS_EX_LAYERED, which breaks DWM
+        // transparency. Let DWM own the alpha surface, and use WM_NCHITTEST for
+        // click-through instead of changing the whole window's opacity.
+        const GWL_EXSTYLE: i32 = -20;
+        const GWLP_WNDPROC: i32 = -4;
+        const WS_EX_LAYERED: i32 = 0x00080000;
+        let style = GetWindowLongW(window, GWL_EXSTYLE);
+        let composition_style = style & !WS_EX_LAYERED;
+        if style != composition_style {
+            SetWindowLongW(window, GWL_EXSTYLE, composition_style);
+        }
+        if POPUP_SUBCLASSED_WINDOW.load(Ordering::Relaxed) != window {
+            let previous = SetWindowLongPtrW(
+                window,
+                GWLP_WNDPROC,
+                popup_window_proc as *const () as isize,
+            );
+            if previous != 0 {
+                POPUP_ORIGINAL_WINDOW_PROC.store(previous, Ordering::Relaxed);
+                POPUP_SUBCLASSED_WINDOW.store(window, Ordering::Relaxed);
+            }
+        }
+        let size = Vec2::new(
+            (rect.right - rect.left) as f32,
+            (rect.bottom - rect.top) as f32,
+        );
+        let [x, y] = popup_screen_position(area, size, position);
+        let x = x.round() as i32;
+        let y = y.round() as i32;
+        if rect.left != x || rect.top != y {
+            SetWindowPos(
+                window,
+                std::ptr::null_mut(),
+                x,
+                y,
+                0,
+                0,
+                SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+            );
+        }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn set_windows_popup_position(_: MonitorArea, _: PopupPosition) {}
 
 struct GpuInfo {
     name: String,
@@ -582,6 +734,7 @@ struct App {
     exiting: bool,
     popup_position: PopupPosition,
     popup_monitor: usize,
+    popup_size: PopupSize,
     popup_cpu: bool,
     popup_gpu: bool,
     popup_memory: bool,
@@ -627,6 +780,7 @@ struct SavedSettings {
     popup: bool,
     popup_position: PopupPosition,
     popup_monitor: usize,
+    popup_size: PopupSize,
     popup_cpu: bool,
     popup_gpu: bool,
     popup_memory: bool,
@@ -646,6 +800,7 @@ impl SavedSettings {
             popup: false,
             popup_position: PopupPosition::TopRight,
             popup_monitor: 0,
+            popup_size: PopupSize::Medium,
             popup_cpu: true,
             popup_gpu: false,
             popup_memory: true,
@@ -684,6 +839,13 @@ impl SavedSettings {
                         .unwrap_or(self.popup_position)
                 }
                 "popup_monitor" => self.popup_monitor = value.parse().unwrap_or(self.popup_monitor),
+                "popup_size" => {
+                    self.popup_size = value
+                        .parse::<u8>()
+                        .ok()
+                        .map(PopupSize::from_code)
+                        .unwrap_or(self.popup_size)
+                }
                 "popup_cpu" => self.popup_cpu = parse_bool(value).unwrap_or(self.popup_cpu),
                 "popup_gpu" => self.popup_gpu = parse_bool(value).unwrap_or(self.popup_gpu),
                 "popup_memory" => {
@@ -700,7 +862,7 @@ impl SavedSettings {
                     if let Ok(opacity) = value.parse::<f32>()
                         && opacity.is_finite()
                     {
-                        self.popup_opacity = opacity.clamp(0.30, 1.0);
+                        self.popup_opacity = opacity.clamp(0.0, 1.0);
                     }
                 }
                 "language" => {
@@ -732,6 +894,7 @@ impl SavedSettings {
                 "popup={}\n",
                 "popup_position={}\n",
                 "popup_monitor={}\n",
+                "popup_size={}\n",
                 "popup_cpu={}\n",
                 "popup_gpu={}\n",
                 "popup_memory={}\n",
@@ -747,6 +910,7 @@ impl SavedSettings {
             u8::from(self.popup),
             self.popup_position.code(),
             self.popup_monitor,
+            self.popup_size.code(),
             u8::from(self.popup_cpu),
             u8::from(self.popup_gpu),
             u8::from(self.popup_memory),
@@ -803,6 +967,7 @@ impl App {
             exiting: false,
             popup_position: settings.popup_position,
             popup_monitor: settings.popup_monitor,
+            popup_size: settings.popup_size,
             popup_cpu: settings.popup_cpu,
             popup_gpu: settings.popup_gpu,
             popup_memory: settings.popup_memory,
@@ -837,6 +1002,7 @@ impl App {
             popup: self.popup,
             popup_position: self.popup_position,
             popup_monitor: self.popup_monitor,
+            popup_size: self.popup_size,
             popup_cpu: self.popup_cpu,
             popup_gpu: self.popup_gpu,
             popup_memory: self.popup_memory,
@@ -1536,8 +1702,18 @@ impl App {
             });
             ui.add_space(12.0);
             card(ui, |ui| {
+                ui.label(RichText::new(tr(lang, "popup_size")).strong().size(15.0));
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    for size in PopupSize::ALL {
+                        ui.radio_value(&mut self.popup_size, size, tr(lang, size.key()));
+                    }
+                });
+            });
+            ui.add_space(12.0);
+            card(ui, |ui| {
                 ui.label(RichText::new(tr(lang, "opacity")).strong().size(15.0));
-                ui.add(egui::Slider::new(&mut self.popup_opacity, 0.30..=1.0).show_value(true));
+                ui.add(egui::Slider::new(&mut self.popup_opacity, 0.0..=1.0).show_value(true));
             });
         });
         ui.add_space(12.0);
@@ -1586,7 +1762,8 @@ impl App {
         if !self.popup {
             return;
         }
-        let width = 292.0;
+        let popup_scale = self.popup_size.scale();
+        let width = 292.0 * popup_scale;
         let shown = [
             self.popup_cpu,
             self.popup_gpu,
@@ -1610,14 +1787,13 @@ impl App {
         } else {
             0
         };
-        let height = 48.0 + count as f32 * 31.0 + graph_rows as f32 * 76.0;
+        let height = (48.0 + count as f32 * 31.0 + graph_rows as f32 * 76.0) * popup_scale;
         let monitors = monitor_areas(ctx);
         self.popup_monitor = self.popup_monitor.min(monitors.len().saturating_sub(1));
-        let position = popup_screen_position(
-            monitors[self.popup_monitor],
-            Vec2::new(width, height),
-            self.popup_position,
-        );
+        let monitor_area = monitors[self.popup_monitor];
+        let popup_position = self.popup_position;
+        let position =
+            popup_screen_position(monitor_area, Vec2::new(width, height), popup_position);
         let disk_total: u64 = self.disks.iter().map(|d| d.total_space()).sum();
         let disk_used: u64 = self
             .disks
@@ -1650,6 +1826,7 @@ impl App {
         let opacity = self.popup_opacity;
         let lang = self.language;
         let graphs = self.popup_graphs;
+        let scale = popup_scale;
         let builder = egui::ViewportBuilder::default()
             .with_title("Resource Monitor Popup")
             .with_inner_size([width, height])
@@ -1658,8 +1835,10 @@ impl App {
             .with_decorations(false)
             .with_always_on_top()
             .with_taskbar(false)
-            .with_mouse_passthrough(true)
+            .with_has_shadow(false)
             .with_transparent(true);
+        #[cfg(not(target_os = "windows"))]
+        let builder = builder.with_mouse_passthrough(true);
         // 부모 창의 최소화/복원 중에도 팝업은 별도의 렌더링 콜백을 사용합니다.
         // 작은 읽기 전용 스냅샷을 전달하여 UI 사이에 잠금이나 중첩 렌더링이 없습니다.
         let popup_closed = Arc::clone(&self.popup_closed);
@@ -1668,7 +1847,7 @@ impl App {
             egui::ViewportId::from_hash_of("monitor_popup"),
             builder,
             move |ui, _| {
-                set_windows_popup_opacity(opacity);
+                set_windows_popup_position(monitor_area, popup_position);
                 egui::CentralPanel::default()
                     .frame(
                         egui::Frame::new()
@@ -1677,14 +1856,26 @@ impl App {
                             } else {
                                 popup_background(248, 249, 251, opacity)
                             })
-                            .corner_radius(if cfg!(target_os = "macos") { 12 } else { 4 })
-                            .inner_margin(Margin::same(14)),
+                            .corner_radius(if cfg!(target_os = "macos") { 12 } else { 9 })
+                            .inner_margin(Margin::same((14.0 * scale).round() as i8)),
                     )
                     .show(ui, |ui| {
                         ui.horizontal(|ui| {
-                            ui.label(RichText::new("Resource Monitor").strong().size(14.0));
+                            ui.label(
+                                RichText::new("Resource Monitor")
+                                    .strong()
+                                    .family(popup_font_family())
+                                    .color(popup_text_color(ui))
+                                    .size(14.5 * scale),
+                            );
                             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                ui.label(RichText::new("● LIVE").color(GREEN).size(9.0));
+                                ui.label(
+                                    RichText::new("● LIVE")
+                                        .strong()
+                                        .family(popup_font_family())
+                                        .color(GREEN)
+                                        .size(9.5 * scale),
+                                );
                             });
                         });
                         ui.separator();
@@ -1709,7 +1900,7 @@ impl App {
                                 if let Some(temperature) = temperature_text(temperatures[index]) {
                                     value.push_str(&format!("  •  {temperature}"));
                                 }
-                                popup_row(ui, labels[index], &value, colors[index]);
+                                popup_row(ui, labels[index], &value, colors[index], scale);
                             }
                         }
                         if graphs {
@@ -1726,6 +1917,7 @@ impl App {
                                             labels[*index],
                                             &histories[*index],
                                             colors[*index],
+                                            scale,
                                         );
                                     }
                                 });
@@ -2055,6 +2247,7 @@ struct PopupConfig {
     opacity: f32,
     position: PopupPosition,
     monitor: usize,
+    size: PopupSize,
     shown: [bool; 6],
     graphs: bool,
     language: Language,
@@ -2083,10 +2276,16 @@ impl PopupConfig {
             .next()
             .and_then(|value| value.parse().ok())
             .unwrap_or(0);
+        let size = parts
+            .next()
+            .and_then(|value| value.parse().ok())
+            .map(PopupSize::from_code)
+            .unwrap_or(PopupSize::Medium);
         Some(Self {
             opacity,
             position,
             monitor,
+            size,
             shown,
             graphs: flags.as_bytes().get(6) == Some(&b'1'),
             language,
@@ -2106,7 +2305,8 @@ impl PopupConfig {
         } else {
             0
         };
-        48.0 + (count + usize::from(has_temperature)) as f32 * 31.0 + graph_rows as f32 * 76.0
+        (48.0 + (count + usize::from(has_temperature)) as f32 * 31.0 + graph_rows as f32 * 76.0)
+            * self.size.scale()
     }
 }
 
@@ -2218,13 +2418,15 @@ impl eframe::App for PopupApp {
         temperatures[1] = self.gpu.temperature.or(temperatures[1]);
         temperatures[2] = self.temperature_monitor.values.memory.or(temperatures[2]);
         temperatures[3] = self.temperature_monitor.values.disk.or(temperatures[3]);
-        let size = Vec2::new(292.0, self.config.window_height(false));
+        let scale = self.config.size.scale();
+        let size = Vec2::new(292.0 * scale, self.config.window_height(false));
         let monitors = monitor_areas(&ctx);
         let monitor = self.config.monitor.min(monitors.len().saturating_sub(1));
-        let pos = popup_screen_position(monitors[monitor], size, self.config.position);
+        let monitor_area = monitors[monitor];
+        let pos = popup_screen_position(monitor_area, size, self.config.position);
         if self.layout_dirty {
             ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(Vec2::new(
-                292.0,
+                292.0 * scale,
                 self.config.window_height(false),
             )));
             ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos.into()));
@@ -2237,7 +2439,7 @@ impl eframe::App for PopupApp {
             .iter()
             .map(|(_, n)| n.transmitted())
             .sum::<u64>();
-        set_windows_popup_opacity(self.config.opacity);
+        set_windows_popup_position(monitor_area, self.config.position);
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::new()
@@ -2246,14 +2448,26 @@ impl eframe::App for PopupApp {
                     } else {
                         popup_background(248, 249, 251, self.config.opacity)
                     })
-                    .corner_radius(if cfg!(target_os = "macos") { 12 } else { 4 })
-                    .inner_margin(Margin::same(14)),
+                    .corner_radius(if cfg!(target_os = "macos") { 12 } else { 9 })
+                    .inner_margin(Margin::same((14.0 * scale).round() as i8)),
             )
             .show(root, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new("Resource Monitor").strong().size(14.0));
+                    ui.label(
+                        RichText::new("Resource Monitor")
+                            .strong()
+                            .family(popup_font_family())
+                            .color(popup_text_color(ui))
+                            .size(14.5 * scale),
+                    );
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        ui.label(RichText::new("● LIVE").color(GREEN).size(9.0));
+                        ui.label(
+                            RichText::new("● LIVE")
+                                .strong()
+                                .family(popup_font_family())
+                                .color(GREEN)
+                                .size(9.5 * scale),
+                        );
                     });
                 });
                 ui.separator();
@@ -2278,7 +2492,7 @@ impl eframe::App for PopupApp {
                         if let Some(temperature) = temperature_text(temperatures[i]) {
                             value.push_str(&format!("  •  {temperature}"));
                         }
-                        popup_row(ui, labels[i], &value, colors[i]);
+                        popup_row(ui, labels[i], &value, colors[i], scale);
                     }
                 }
                 if self.config.graphs {
@@ -2295,6 +2509,7 @@ impl eframe::App for PopupApp {
                                     labels[*index],
                                     &self.histories[*index],
                                     colors[*index],
+                                    scale,
                                 );
                             }
                         });
@@ -2309,9 +2524,18 @@ impl eframe::App for PopupApp {
     }
 }
 
-fn mini_chart(ui: &mut egui::Ui, label: &str, values: &VecDeque<f32>, color: Color32) {
-    ui.label(RichText::new(label).weak().size(9.0));
-    let (r, p) = ui.allocate_painter(Vec2::new(ui.available_width(), 46.0), Sense::hover());
+fn mini_chart(ui: &mut egui::Ui, label: &str, values: &VecDeque<f32>, color: Color32, scale: f32) {
+    ui.label(
+        RichText::new(label)
+            .strong()
+            .family(popup_font_family())
+            .color(popup_text_color(ui))
+            .size(10.0 * scale),
+    );
+    let (r, p) = ui.allocate_painter(
+        Vec2::new(ui.available_width(), 46.0 * scale),
+        Sense::hover(),
+    );
     if values.len() > 1 {
         let points = values
             .iter()
@@ -2523,6 +2747,7 @@ mod settings_tests {
             popup: true,
             popup_position: PopupPosition::BottomCenter,
             popup_monitor: 1,
+            popup_size: PopupSize::Large,
             popup_cpu: false,
             popup_gpu: true,
             popup_memory: false,
@@ -2724,6 +2949,24 @@ fn configure_fonts(ctx: &egui::Context) {
     };
 
     let mut fonts = egui::FontDefinitions::default();
+    #[cfg(target_os = "windows")]
+    if let Ok(data) = std::fs::read("C:\\Windows\\Fonts\\malgunbd.ttf") {
+        let name = "popup-bold".to_owned();
+        fonts
+            .font_data
+            .insert(name.clone(), egui::FontData::from_owned(data).into());
+        let mut family = vec![name];
+        family.extend(
+            fonts
+                .families
+                .get(&egui::FontFamily::Proportional)
+                .cloned()
+                .unwrap_or_default(),
+        );
+        fonts
+            .families
+            .insert(egui::FontFamily::Name("popup-bold".into()), family);
+    }
     let mut added = false;
     for (index, data) in candidates
         .iter()
@@ -3007,13 +3250,39 @@ fn pair(ui: &mut egui::Ui, label: &str, value: &str) {
     ui.label(RichText::new(label).weak().size(12.0));
     ui.label(RichText::new(value).strong());
 }
-fn popup_row(ui: &mut egui::Ui, label: &str, value: &str, color: Color32) {
+fn popup_row(ui: &mut egui::Ui, label: &str, value: &str, color: Color32, scale: f32) {
     ui.horizontal(|ui| {
-        ui.label(RichText::new(label).weak());
+        ui.label(
+            RichText::new(label)
+                .strong()
+                .family(popup_font_family())
+                .color(popup_text_color(ui))
+                .size(14.5 * scale),
+        );
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            ui.label(RichText::new(value).strong().color(color));
+            ui.label(
+                RichText::new(value)
+                    .strong()
+                    .family(popup_font_family())
+                    .size(14.5 * scale)
+                    .color(color),
+            );
         });
     });
+}
+fn popup_text_color(ui: &egui::Ui) -> Color32 {
+    if ui.visuals().dark_mode {
+        Color32::from_rgb(250, 251, 253)
+    } else {
+        Color32::from_rgb(28, 30, 34)
+    }
+}
+fn popup_font_family() -> egui::FontFamily {
+    if cfg!(target_os = "windows") {
+        egui::FontFamily::Name("popup-bold".into())
+    } else {
+        egui::FontFamily::Proportional
+    }
 }
 fn push(q: &mut VecDeque<f32>, v: f32) {
     if q.len() == HISTORY {
@@ -3068,50 +3337,13 @@ fn temperature_text(value: Option<f32>) -> Option<String> {
 }
 
 fn popup_background(red: u8, green: u8, blue: u8, opacity: f32) -> Color32 {
-    if cfg!(target_os = "windows") {
-        Color32::from_rgb(red, green, blue)
-    } else {
-        Color32::from_rgba_unmultiplied(red, green, blue, (opacity * 255.0) as u8)
-    }
+    Color32::from_rgba_unmultiplied(
+        red,
+        green,
+        blue,
+        (opacity.clamp(0.0, 1.0) * 255.0).round() as u8,
+    )
 }
-
-#[cfg(target_os = "windows")]
-fn set_windows_popup_opacity(opacity: f32) {
-    use std::ffi::c_void;
-
-    type Hwnd = *mut c_void;
-    const GWL_EXSTYLE: i32 = -20;
-    const WS_EX_LAYERED: i32 = 0x0008_0000;
-    const LWA_ALPHA: u32 = 0x0000_0002;
-
-    #[link(name = "user32")]
-    unsafe extern "system" {
-        fn FindWindowW(class_name: *const u16, window_name: *const u16) -> Hwnd;
-        fn GetWindowLongW(window: Hwnd, index: i32) -> i32;
-        fn SetWindowLongW(window: Hwnd, index: i32, value: i32) -> i32;
-        fn SetLayeredWindowAttributes(window: Hwnd, color_key: u32, alpha: u8, flags: u32) -> i32;
-    }
-
-    let title: Vec<u16> = "Resource Monitor Popup\0".encode_utf16().collect();
-    unsafe {
-        let window = FindWindowW(std::ptr::null(), title.as_ptr());
-        if !window.is_null() {
-            let style = GetWindowLongW(window, GWL_EXSTYLE);
-            if style & WS_EX_LAYERED == 0 {
-                SetWindowLongW(window, GWL_EXSTYLE, style | WS_EX_LAYERED);
-            }
-            SetLayeredWindowAttributes(
-                window,
-                0,
-                (opacity.clamp(0.0, 1.0) * 255.0).round() as u8,
-                LWA_ALPHA,
-            );
-        }
-    }
-}
-
-#[cfg(not(target_os = "windows"))]
-fn set_windows_popup_opacity(_: f32) {}
 fn temperature_value(value: Option<f32>) -> String {
     temperature_text(value).unwrap_or_else(|| "—".to_owned())
 }
@@ -3189,6 +3421,14 @@ fn tr<'a>(lang: Language, key: &'a str) -> &'a str {
         (Language::Japanese, "screen_position") => "画面位置",
         (Language::Korean, "monitor") => "모니터",
         (Language::Japanese, "monitor") => "モニター",
+        (Language::Korean, "popup_size") => "팝업 크기",
+        (Language::Japanese, "popup_size") => "ポップアップサイズ",
+        (Language::Korean, "small") => "작게",
+        (Language::Japanese, "small") => "小",
+        (Language::Korean, "medium") => "중간",
+        (Language::Japanese, "medium") => "中",
+        (Language::Korean, "large") => "크게",
+        (Language::Japanese, "large") => "大",
         (Language::Korean, "opacity") => "팝업 투명도",
         (Language::Japanese, "opacity") => "ポップアップの透明度",
         (Language::Korean, "top_left") => "왼쪽 상단",
@@ -3329,6 +3569,10 @@ fn tr<'a>(lang: Language, key: &'a str) -> &'a str {
         (_, "network_speed") => "Network speed",
         (_, "screen_position") => "Screen position",
         (_, "monitor") => "Monitor",
+        (_, "popup_size") => "Popup size",
+        (_, "small") => "Small",
+        (_, "medium") => "Medium",
+        (_, "large") => "Large",
         (_, "opacity") => "Popup opacity",
         (_, "top_left") => "Top left",
         (_, "top_center") => "Top center",
@@ -3428,30 +3672,38 @@ fn main() -> eframe::Result {
             .unwrap_or(2)
             .clamp(1, 10);
         let monitor = args.get(8).and_then(|v| v.parse().ok()).unwrap_or(0);
+        let size = PopupSize::from_code(args.get(9).and_then(|v| v.parse().ok()).unwrap_or(1));
+        let scale = size.scale();
         let count = shown.into_iter().filter(|v| *v).count().max(1);
         let rows = if graphs { (count + 1) / 2 } else { 0 };
-        let height = 48.0 + count as f32 * 31.0 + rows as f32 * 76.0;
+        let height = (48.0 + count as f32 * 31.0 + rows as f32 * 76.0) * scale;
         let config = PopupConfig {
             opacity,
             position,
             monitor,
+            size,
             shown,
             graphs,
             language,
             dark,
             refresh_secs,
         };
+        let popup_viewport = egui::ViewportBuilder::default()
+            .with_title("Resource Monitor Popup")
+            .with_inner_size([292.0 * scale, height])
+            .with_resizable(false)
+            .with_decorations(false)
+            .with_always_on_top()
+            .with_taskbar(false)
+            .with_has_shadow(false)
+            .with_transparent(true);
+        #[cfg(not(target_os = "windows"))]
+        let popup_viewport = popup_viewport.with_mouse_passthrough(true);
         let options = eframe::NativeOptions {
-            viewport: egui::ViewportBuilder::default()
-                .with_title("Resource Monitor Popup")
-                .with_inner_size([292.0, height])
-                .with_resizable(false)
-                .with_decorations(false)
-                .with_always_on_top()
-                .with_taskbar(false)
-                .with_mouse_passthrough(true)
-                .with_transparent(true),
+            viewport: popup_viewport,
             renderer: native_renderer(),
+            wgpu_options: native_wgpu_options(),
+            dithering: false,
             ..Default::default()
         };
         return eframe::run_native(
@@ -3479,6 +3731,8 @@ fn main() -> eframe::Result {
         viewport,
         centered: true,
         renderer: native_renderer(),
+        wgpu_options: native_wgpu_options(),
+        dithering: false,
         ..Default::default()
     };
     eframe::run_native(
@@ -3562,4 +3816,8 @@ fn native_renderer() -> eframe::Renderer {
 #[cfg(not(target_os = "windows"))]
 fn native_renderer() -> eframe::Renderer {
     eframe::Renderer::Wgpu
+}
+
+fn native_wgpu_options() -> eframe::WgpuConfiguration {
+    eframe::WgpuConfiguration::default()
 }

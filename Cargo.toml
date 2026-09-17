@@ -1,17 +1,17 @@
 [package]
 name = "resource_monitor"
-version = "0.1.6"
+version = "0.1.7"
 edition = "2024"
 
 [dependencies]
-eframe = { version = "0.36.1", default-features = false, features = ["accesskit", "default_fonts", "links", "wgpu"] }
+eframe = { version = "0.36.2", default-features = false, features = ["accesskit", "default_fonts", "links", "wgpu"] }
 semver = "1.0.28"
 serde_json = "1.0.151"
 sysinfo = "0.38.4"
 ureq = { version = "3.4.0", features = ["json"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
-eframe = { version = "0.36.1", default-features = false, features = ["glow"] }
+eframe = { version = "0.36.2", default-features = false, features = ["glow"] }
 tray-icon = { version = "0.25.1", default-features = false }
 
 [profile.release]
