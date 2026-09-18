@@ -12,7 +12,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicIsize, AtomicPtr};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicBool, Ordering},
 };
 use std::time::{Duration, Instant};
@@ -279,6 +279,8 @@ unsafe extern "system" {
     ) -> i32;
     fn GetMonitorInfoW(monitor: *mut c_void, info: *mut WinMonitorInfo) -> i32;
     fn FindWindowW(class_name: *const u16, window_name: *const u16) -> *mut c_void;
+    fn ShowWindow(window: *mut c_void, command: i32) -> i32;
+    fn SetForegroundWindow(window: *mut c_void) -> i32;
     fn GetWindowRect(window: *mut c_void, rect: *mut WinRect) -> i32;
     fn GetWindowLongW(window: *mut c_void, index: i32) -> i32;
     fn SetWindowLongW(window: *mut c_void, index: i32, value: i32) -> i32;
@@ -756,6 +758,7 @@ struct App {
     update_download_rx: Option<Receiver<Result<std::path::PathBuf, String>>>,
     downloaded_update: Option<std::path::PathBuf>,
     update_download_error: Option<String>,
+    update_on_exit: Arc<Mutex<Option<std::path::PathBuf>>>,
     #[cfg(target_os = "windows")]
     tray: Option<TrayState>,
 }
@@ -926,7 +929,10 @@ impl SavedSettings {
 }
 
 impl App {
-    fn new(cc: &eframe::CreationContext<'_>) -> Self {
+    fn new(
+        cc: &eframe::CreationContext<'_>,
+        update_on_exit: Arc<Mutex<Option<std::path::PathBuf>>>,
+    ) -> Self {
         configure_fonts(&cc.egui_ctx);
         #[cfg(target_os = "macos")]
         install_macos_reopen_handler(&cc.egui_ctx);
@@ -989,6 +995,7 @@ impl App {
             update_download_rx: None,
             downloaded_update: None,
             update_download_error: None,
+            update_on_exit,
             #[cfg(target_os = "windows")]
             tray,
         };
@@ -2148,10 +2155,17 @@ impl eframe::App for App {
                                 self.available_update = None;
                             }
                             if let Some(path) = self.downloaded_update.clone() {
-                                if ui.button(tr(self.language, "install_update")).clicked()
-                                    && let Err(error) = launch_update(&path)
-                                {
-                                    self.update_download_error = Some(error);
+                                if ui.button(tr(self.language, "install_update")).clicked() {
+                                    if let Ok(mut pending) = self.update_on_exit.lock() {
+                                        *pending = Some(path);
+                                        self.exiting = true;
+                                        self.popup = false;
+                                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                                    } else {
+                                        self.update_download_error = Some(
+                                            "업데이트 종료 상태를 저장할 수 없습니다.".to_owned(),
+                                        );
+                                    }
                                 }
                             } else if self.update_download_rx.is_some() {
                                 ui.add_enabled(
@@ -2720,10 +2734,16 @@ fn launch_update(path: &std::path::Path) -> Result<(), String> {
     #[cfg(target_os = "windows")]
     let result = {
         use std::os::windows::process::CommandExt;
-        Command::new("cmd")
-            .arg("/C")
-            .arg("start")
-            .arg("")
+        Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-WindowStyle",
+                "Hidden",
+                "-Command",
+                "$targetProcessId=[int]$args[0]; $installer=$args[1]; Wait-Process -Id $targetProcessId -ErrorAction SilentlyContinue; Start-Process -FilePath $installer",
+            ])
+            .arg(std::process::id().to_string())
             .arg(path)
             .creation_flags(0x08000000)
             .spawn()
@@ -3646,15 +3666,80 @@ fn refresh_label(language: Language, seconds: u64) -> String {
     }
 }
 
+#[cfg(target_os = "windows")]
+struct SingleInstanceGuard(*mut c_void);
+
+#[cfg(target_os = "windows")]
+impl Drop for SingleInstanceGuard {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe { CloseHandle(self.0) };
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn CreateMutexW(attributes: *const c_void, initial_owner: i32, name: *const u16)
+    -> *mut c_void;
+    fn GetLastError() -> u32;
+    fn CloseHandle(handle: *mut c_void) -> i32;
+}
+
+#[cfg(target_os = "windows")]
+fn acquire_single_instance() -> Option<SingleInstanceGuard> {
+    const ERROR_ALREADY_EXISTS: u32 = 183;
+    let name: Vec<u16> = "Global\\Mobil0010.ResourceMonitor.Singleton\0"
+        .encode_utf16()
+        .collect();
+    unsafe {
+        let handle = CreateMutexW(std::ptr::null(), 0, name.as_ptr());
+        if handle.is_null() {
+            // 잠금 생성 자체가 거부된 환경에서는 앱 실행을 막지 않습니다.
+            return Some(SingleInstanceGuard(std::ptr::null_mut()));
+        }
+        if GetLastError() == ERROR_ALREADY_EXISTS {
+            CloseHandle(handle);
+            focus_existing_instance();
+            return None;
+        }
+        Some(SingleInstanceGuard(handle))
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn focus_existing_instance() {
+    const SW_RESTORE: i32 = 9;
+    let title: Vec<u16> = "Resource Monitor\0".encode_utf16().collect();
+    unsafe {
+        let window = FindWindowW(std::ptr::null(), title.as_ptr());
+        if !window.is_null() {
+            ShowWindow(window, SW_RESTORE);
+            SetForegroundWindow(window);
+        }
+    }
+}
+
 fn main() -> eframe::Result {
     let args: Vec<String> = std::env::args().collect();
     #[cfg(target_os = "windows")]
     if !ensure_windows_elevated(&args) {
         return Ok(());
     }
+    let popup_process = args.get(1).is_some_and(|arg| arg == "--popup");
+    #[cfg(target_os = "windows")]
+    let _single_instance = if popup_process {
+        None
+    } else {
+        let Some(instance) = acquire_single_instance() else {
+            return Ok(());
+        };
+        Some(instance)
+    };
     #[cfg(target_os = "windows")]
     ensure_pawnio_installed();
-    if args.get(1).is_some_and(|arg| arg == "--popup") {
+    if popup_process {
         let opacity = args.get(2).and_then(|v| v.parse().ok()).unwrap_or(0.92);
         let position =
             PopupPosition::from_code(args.get(3).and_then(|v| v.parse().ok()).unwrap_or(2));
@@ -3735,11 +3820,20 @@ fn main() -> eframe::Result {
         dithering: false,
         ..Default::default()
     };
-    eframe::run_native(
+    let update_on_exit = Arc::new(Mutex::new(None));
+    let app_update_on_exit = Arc::clone(&update_on_exit);
+    let result = eframe::run_native(
         "Resource Monitor",
         options,
-        Box::new(|cc| Ok(Box::new(App::new(cc)))),
-    )
+        Box::new(move |cc| Ok(Box::new(App::new(cc, Arc::clone(&app_update_on_exit))))),
+    );
+    if result.is_ok()
+        && let Ok(mut pending) = update_on_exit.lock()
+        && let Some(path) = pending.take()
+    {
+        let _ = launch_update(&path);
+    }
+    result
 }
 
 #[cfg(target_os = "windows")]
