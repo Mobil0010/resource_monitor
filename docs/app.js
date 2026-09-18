@@ -64,7 +64,10 @@ function detectPlatform() {
 
 function detectLanguage() {
   const override = new URLSearchParams(location.search).get("lang");
-  if (["ko", "en"].includes(override)) return override;
+  if (["ko", "en"].includes(override)) {
+    try { localStorage.setItem("resource-monitor-language", override); } catch {}
+    return override;
+  }
   try {
     const saved = localStorage.getItem("resource-monitor-language");
     if (["ko", "en"].includes(saved)) return saved;
@@ -145,7 +148,10 @@ function applyLanguage(nextLanguage, persist = false) {
 }
 
 document.querySelectorAll("[data-language]").forEach((button) => {
-  button.addEventListener("click", () => applyLanguage(button.dataset.language, true));
+  button.addEventListener("click", (event) => {
+    event.preventDefault();
+    applyLanguage(button.dataset.language, true);
+  });
 });
 
 const menuButton = document.querySelector("#other-platforms");
