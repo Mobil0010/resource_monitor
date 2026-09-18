@@ -4,6 +4,11 @@ on:
   push:
     branches:
       - master
+    paths-ignore:
+      - "docs/**"
+      - "tests/site-downloads.test.mjs"
+      - ".github/workflows/pages.yml"
+      - ".github/workflows/release.yml"
   workflow_dispatch:
 
 permissions:

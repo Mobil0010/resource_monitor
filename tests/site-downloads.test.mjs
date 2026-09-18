@@ -15,22 +15,33 @@ const release = {
   })),
 };
 
-async function render(platform, payload = release, status = 200, search = "") {
+async function render(platform, payload = release, status = 200, search = "", systemLanguage = "en-US") {
   const elements = new Map();
   function element(selector) {
     if (!elements.has(selector)) elements.set(selector, {
-      hidden: false, attributes: {}, textContent: "",
+      hidden: false, attributes: {}, dataset: {}, textContent: "",
       querySelector: (child) => element(selector + " " + child),
       setAttribute(key, value) { this.attributes[key] = value; },
       removeAttribute(key) { delete this.attributes[key]; },
-      addEventListener() {},
+      addEventListener(type, handler) { this.listeners ||= {}; this.listeners[type] = handler; },
     });
     return elements.get(selector);
   }
   const body = { dataset: { repository: "Mobil0010/resource_monitor" } };
+  const documentElement = { lang: "ko" };
+  const languageButtons = ["ko", "en"].map((language) => {
+    const button = element(`[data-language="${language}"]`);
+    button.dataset.language = language;
+    return button;
+  });
   const context = vm.createContext({
-    document: { body, querySelector: element },
-    navigator: { platform, userAgent: platform },
+    document: {
+      body, documentElement, title: "",
+      querySelector: element,
+      querySelectorAll: (selector) => selector === "[data-language]" ? languageButtons : [],
+    },
+    navigator: { platform, userAgent: platform, language: systemLanguage, languages: [systemLanguage] },
+    localStorage: { getItem: () => null, setItem() {} },
     location: { search },
     URLSearchParams, Intl, Date,
     AbortSignal: { timeout: () => undefined },
@@ -41,7 +52,7 @@ async function render(platform, payload = release, status = 200, search = "") {
     },
   });
   await vm.runInContext(source, context);
-  return { element, body };
+  return { element, body, documentElement, languageButtons };
 }
 
 for (const [platform, suffix] of [["MacIntel", suffixes[0]], ["Win32", suffixes[1]]]) {
@@ -60,6 +71,14 @@ test("unknown OS links to releases, not a Mac installer", async () => {
 test("platform override works on project Pages URLs", async () => {
   const { element } = await render("MacIntel", release, 200, "?platform=windows");
   assert.ok(element("#primary-download").href.endsWith(suffixes[1]));
+});
+test("Korean system language selects Korean", async () => {
+  const { documentElement } = await render("Win32", release, 200, "", "ko-KR");
+  assert.equal(documentElement.lang, "ko");
+});
+test("language query override selects English", async () => {
+  const { documentElement } = await render("Win32", release, 200, "?lang=en", "ko-KR");
+  assert.equal(documentElement.lang, "en");
 });
 for (const [label, payload, status] of [
   ["missing release", {}, 404],
