@@ -2682,17 +2682,22 @@ fn launch_update(path: &std::path::Path) -> Result<(), String> {
     #[cfg(target_os = "windows")]
     let result = {
         use std::os::windows::process::CommandExt;
-        Command::new("powershell")
+        let installer = path.to_string_lossy().replace('\'', "''");
+        let command = format!(
+            "$installer='{installer}'; Wait-Process -Id {} -ErrorAction SilentlyContinue; Start-Process -FilePath $installer",
+            std::process::id()
+        );
+        Command::new("C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe")
             .args([
                 "-NoProfile",
                 "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
                 "-WindowStyle",
                 "Hidden",
                 "-Command",
-                "$targetProcessId=[int]$args[0]; $installer=$args[1]; Wait-Process -Id $targetProcessId -ErrorAction SilentlyContinue; Start-Process -FilePath $installer",
             ])
-            .arg(std::process::id().to_string())
-            .arg(path)
+            .arg(command)
             .creation_flags(0x08000000)
             .spawn()
     };
