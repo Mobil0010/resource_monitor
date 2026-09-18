@@ -8,8 +8,6 @@ use std::ffi::{c_char, c_void};
 use std::process::Command;
 #[cfg(target_os = "macos")]
 use std::sync::OnceLock;
-#[cfg(target_os = "windows")]
-use std::sync::atomic::{AtomicIsize, AtomicPtr};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::{
     Arc, Mutex,
@@ -39,11 +37,6 @@ const RELEASE_API: &str = "https://api.github.com/repos/Mobil0010/resource_monit
 static MAC_REOPEN_REQUESTED: AtomicBool = AtomicBool::new(false);
 #[cfg(target_os = "macos")]
 static MAC_EGUI_CONTEXT: OnceLock<egui::Context> = OnceLock::new();
-#[cfg(target_os = "windows")]
-static POPUP_SUBCLASSED_WINDOW: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
-#[cfg(target_os = "windows")]
-static POPUP_ORIGINAL_WINDOW_PROC: AtomicIsize = AtomicIsize::new(0);
-
 #[cfg(target_os = "macos")]
 #[link(name = "objc")]
 unsafe extern "C" {
@@ -282,17 +275,6 @@ unsafe extern "system" {
     fn ShowWindow(window: *mut c_void, command: i32) -> i32;
     fn SetForegroundWindow(window: *mut c_void) -> i32;
     fn GetWindowRect(window: *mut c_void, rect: *mut WinRect) -> i32;
-    fn GetWindowLongW(window: *mut c_void, index: i32) -> i32;
-    fn SetWindowLongW(window: *mut c_void, index: i32, value: i32) -> i32;
-    fn SetWindowLongPtrW(window: *mut c_void, index: i32, value: isize) -> isize;
-    fn CallWindowProcW(
-        previous: isize,
-        window: *mut c_void,
-        message: u32,
-        wparam: usize,
-        lparam: isize,
-    ) -> isize;
-    fn DefWindowProcW(window: *mut c_void, message: u32, wparam: usize, lparam: isize) -> isize;
     fn SetWindowPos(
         window: *mut c_void,
         insert_after: *mut c_void,
@@ -302,26 +284,6 @@ unsafe extern "system" {
         height: i32,
         flags: u32,
     ) -> i32;
-}
-
-#[cfg(target_os = "windows")]
-unsafe extern "system" fn popup_window_proc(
-    window: *mut c_void,
-    message: u32,
-    wparam: usize,
-    lparam: isize,
-) -> isize {
-    const WM_NCHITTEST: u32 = 0x0084;
-    const HTTRANSPARENT: isize = -1;
-    if message == WM_NCHITTEST {
-        return HTTRANSPARENT;
-    }
-    let previous = POPUP_ORIGINAL_WINDOW_PROC.load(Ordering::Relaxed);
-    if previous == 0 {
-        unsafe { DefWindowProcW(window, message, wparam, lparam) }
-    } else {
-        unsafe { CallWindowProcW(previous, window, message, wparam, lparam) }
-    }
 }
 
 #[cfg(target_os = "windows")]
@@ -432,28 +394,6 @@ fn set_windows_popup_position(area: MonitorArea, position: PopupPosition) {
         };
         if window.is_null() || GetWindowRect(window, &mut rect) == 0 {
             return;
-        }
-        // winit couples mouse passthrough with WS_EX_LAYERED, which breaks DWM
-        // transparency. Let DWM own the alpha surface, and use WM_NCHITTEST for
-        // click-through instead of changing the whole window's opacity.
-        const GWL_EXSTYLE: i32 = -20;
-        const GWLP_WNDPROC: i32 = -4;
-        const WS_EX_LAYERED: i32 = 0x00080000;
-        let style = GetWindowLongW(window, GWL_EXSTYLE);
-        let composition_style = style & !WS_EX_LAYERED;
-        if style != composition_style {
-            SetWindowLongW(window, GWL_EXSTYLE, composition_style);
-        }
-        if POPUP_SUBCLASSED_WINDOW.load(Ordering::Relaxed) != window {
-            let previous = SetWindowLongPtrW(
-                window,
-                GWLP_WNDPROC,
-                popup_window_proc as *const () as isize,
-            );
-            if previous != 0 {
-                POPUP_ORIGINAL_WINDOW_PROC.store(previous, Ordering::Relaxed);
-                POPUP_SUBCLASSED_WINDOW.store(window, Ordering::Relaxed);
-            }
         }
         let size = Vec2::new(
             (rect.right - rect.left) as f32,
@@ -1843,9 +1783,8 @@ impl App {
             .with_always_on_top()
             .with_taskbar(false)
             .with_has_shadow(false)
-            .with_transparent(true);
-        #[cfg(not(target_os = "windows"))]
-        let builder = builder.with_mouse_passthrough(true);
+            .with_transparent(true)
+            .with_mouse_passthrough(true);
         // 부모 창의 최소화/복원 중에도 팝업은 별도의 렌더링 콜백을 사용합니다.
         // 작은 읽기 전용 스냅샷을 전달하여 UI 사이에 잠금이나 중첩 렌더링이 없습니다.
         let popup_closed = Arc::clone(&self.popup_closed);
@@ -1868,7 +1807,8 @@ impl App {
                     )
                     .show(ui, |ui| {
                         ui.horizontal(|ui| {
-                            ui.label(
+                            popup_outlined_label(
+                                ui,
                                 RichText::new("Resource Monitor")
                                     .strong()
                                     .family(popup_font_family())
@@ -1876,7 +1816,8 @@ impl App {
                                     .size(14.5 * scale),
                             );
                             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                ui.label(
+                                popup_outlined_label(
+                                    ui,
                                     RichText::new("● LIVE")
                                         .strong()
                                         .family(popup_font_family())
@@ -2467,7 +2408,8 @@ impl eframe::App for PopupApp {
             )
             .show(root, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label(
+                    popup_outlined_label(
+                        ui,
                         RichText::new("Resource Monitor")
                             .strong()
                             .family(popup_font_family())
@@ -2475,7 +2417,8 @@ impl eframe::App for PopupApp {
                             .size(14.5 * scale),
                     );
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        ui.label(
+                        popup_outlined_label(
+                            ui,
                             RichText::new("● LIVE")
                                 .strong()
                                 .family(popup_font_family())
@@ -2539,7 +2482,8 @@ impl eframe::App for PopupApp {
 }
 
 fn mini_chart(ui: &mut egui::Ui, label: &str, values: &VecDeque<f32>, color: Color32, scale: f32) {
-    ui.label(
+    popup_outlined_label(
+        ui,
         RichText::new(label)
             .strong()
             .family(popup_font_family())
@@ -2551,7 +2495,7 @@ fn mini_chart(ui: &mut egui::Ui, label: &str, values: &VecDeque<f32>, color: Col
         Sense::hover(),
     );
     if values.len() > 1 {
-        let points = values
+        let points: Vec<egui::Pos2> = values
             .iter()
             .enumerate()
             .map(|(i, v)| {
@@ -2564,6 +2508,10 @@ fn mini_chart(ui: &mut egui::Ui, label: &str, values: &VecDeque<f32>, color: Col
                 )
             })
             .collect();
+        p.add(egui::Shape::line(
+            points.clone(),
+            Stroke::new(3.5, popup_outline_color(ui)),
+        ));
         p.add(egui::Shape::line(points, Stroke::new(1.5, color)));
     }
 }
@@ -3272,7 +3220,8 @@ fn pair(ui: &mut egui::Ui, label: &str, value: &str) {
 }
 fn popup_row(ui: &mut egui::Ui, label: &str, value: &str, color: Color32, scale: f32) {
     ui.horizontal(|ui| {
-        ui.label(
+        popup_outlined_label(
+            ui,
             RichText::new(label)
                 .strong()
                 .family(popup_font_family())
@@ -3280,7 +3229,8 @@ fn popup_row(ui: &mut egui::Ui, label: &str, value: &str, color: Color32, scale:
                 .size(14.5 * scale),
         );
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            ui.label(
+            popup_outlined_label(
+                ui,
                 RichText::new(value)
                     .strong()
                     .family(popup_font_family())
@@ -3289,6 +3239,37 @@ fn popup_row(ui: &mut egui::Ui, label: &str, value: &str, color: Color32, scale:
             );
         });
     });
+}
+fn popup_outlined_label(ui: &mut egui::Ui, text: RichText) -> egui::Response {
+    let galley = egui::WidgetText::from(text).into_galley(
+        ui,
+        Some(egui::TextWrapMode::Extend),
+        f32::INFINITY,
+        egui::TextStyle::Body,
+    );
+    let (rect, response) = ui.allocate_exact_size(galley.size(), Sense::hover());
+    let outline = popup_outline_color(ui);
+    for offset in [
+        egui::vec2(-1.0, 0.0),
+        egui::vec2(1.0, 0.0),
+        egui::vec2(0.0, -1.0),
+        egui::vec2(0.0, 1.0),
+    ] {
+        ui.painter().galley_with_override_text_color(
+            rect.min + offset,
+            Arc::clone(&galley),
+            outline,
+        );
+    }
+    ui.painter().galley(rect.min, galley, popup_text_color(ui));
+    response
+}
+fn popup_outline_color(ui: &egui::Ui) -> Color32 {
+    if ui.visuals().dark_mode {
+        Color32::from_black_alpha(230)
+    } else {
+        Color32::from_white_alpha(230)
+    }
 }
 fn popup_text_color(ui: &egui::Ui) -> Color32 {
     if ui.visuals().dark_mode {
@@ -3781,9 +3762,8 @@ fn main() -> eframe::Result {
             .with_always_on_top()
             .with_taskbar(false)
             .with_has_shadow(false)
-            .with_transparent(true);
-        #[cfg(not(target_os = "windows"))]
-        let popup_viewport = popup_viewport.with_mouse_passthrough(true);
+            .with_transparent(true)
+            .with_mouse_passthrough(true);
         let options = eframe::NativeOptions {
             viewport: popup_viewport,
             renderer: native_renderer(),

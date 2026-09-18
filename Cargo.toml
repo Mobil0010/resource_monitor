@@ -1,6 +1,6 @@
 [package]
 name = "resource_monitor"
-version = "0.1.9"
+version = "1.0.0"
 edition = "2024"
 
 [dependencies]
@@ -13,6 +13,9 @@ ureq = { version = "3.4.0", features = ["json"] }
 [target.'cfg(target_os = "windows")'.dependencies]
 eframe = { version = "0.36.2", default-features = false, features = ["glow"] }
 tray-icon = { version = "0.25.1", default-features = false }
+
+[build-dependencies]
+winresource = "0.1.31"
 
 [profile.release]
 opt-level = 3

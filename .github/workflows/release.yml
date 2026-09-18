@@ -24,14 +24,26 @@ jobs:
         with:
           ref: master
           fetch-depth: 0
-      - name: Increase patch version and create tag
+      - name: Resolve release version and create tag
         id: version
         shell: bash
         run: |
           set -euo pipefail
           current=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["package"]["version"])')
-          IFS=. read -r major minor patch <<< "$current"
-          version="$major.$minor.$((patch + 1))"
+          latest=$(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | head -n1)
+          latest=${latest#v}
+          version=$(python3 - "$current" "$latest" <<'PY'
+          import sys
+
+          current = tuple(map(int, sys.argv[1].split(".")))
+          latest = tuple(map(int, sys.argv[2].split("."))) if sys.argv[2] else (0, 0, 0)
+          if current > latest:
+              release = current
+          else:
+              release = (latest[0], latest[1], latest[2] + 1)
+          print(".".join(map(str, release)))
+          PY
+          )
           tag="v$version"
 
           VERSION="$version" python3 - <<'PY'
@@ -69,7 +81,9 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add Cargo.toml Cargo.lock
-          git commit -m "chore(release): $tag"
+          if ! git diff --cached --quiet; then
+            git commit -m "chore(release): $tag"
+          fi
           git tag -a "$tag" -m "Resource Monitor $tag"
           git push origin HEAD:master "$tag"
 

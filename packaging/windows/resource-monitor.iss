@@ -23,6 +23,7 @@ ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 PrivilegesRequired=admin
 UninstallDisplayName=Resource Monitor
+UninstallDisplayIcon={app}\ResourceMonitor.exe
 
 [Languages]
 Name: "korean"; MessagesFile: "compiler:Languages\Korean.isl"
@@ -37,8 +38,11 @@ Source: "{#SourceExe}"; DestDir: "{app}"; DestName: "ResourceMonitor.exe"; Flags
 Source: "..\..\vendor\sensor-support\*"; DestDir: "{app}\sensor-support"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
-Name: "{autoprograms}\Resource Monitor"; Filename: "{app}\ResourceMonitor.exe"
-Name: "{autodesktop}\Resource Monitor"; Filename: "{app}\ResourceMonitor.exe"; Tasks: desktopicon
+Name: "{autoprograms}\Resource Monitor"; Filename: "{app}\ResourceMonitor.exe"; IconFilename: "{app}\ResourceMonitor.exe"
+Name: "{autodesktop}\Resource Monitor"; Filename: "{app}\ResourceMonitor.exe"; IconFilename: "{app}\ResourceMonitor.exe"; Tasks: desktopicon
 
 [Run]
 Filename: "{app}\ResourceMonitor.exe"; Description: "Resource Monitor 실행"; Flags: nowait postinstall skipifsilent
+
+[UninstallDelete]
+Type: filesandordirs; Name: "{app}"
