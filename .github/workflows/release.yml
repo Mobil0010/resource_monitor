@@ -128,6 +128,21 @@ jobs:
           targets: x86_64-pc-windows-msvc
       - name: Build Windows executable
         run: cargo build --release --target x86_64-pc-windows-msvc
+      - name: Download and verify PresentMon
+        shell: pwsh
+        run: |
+          $version = "2.5.1"
+          $expectedSha256 = "9bec3083069f58f911e6a512f4806db51a27bd096103087bc1d05ef54c80a191"
+          $url = "https://github.com/GameTechDev/PresentMon/releases/download/v$version/PresentMon-$version-x64.exe"
+          New-Item -ItemType Directory -Force -Path vendor\presentmon | Out-Null
+          Invoke-WebRequest -UseBasicParsing -Uri $url -OutFile vendor\presentmon\PresentMon.exe
+          $actualSha256 = (Get-FileHash vendor\presentmon\PresentMon.exe -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actualSha256 -ne $expectedSha256) {
+            throw "PresentMon checksum mismatch. Expected $expectedSha256, got $actualSha256"
+          }
+          if ((Get-Item vendor\presentmon\PresentMon.exe).Length -le 0) {
+            throw "PresentMon download is empty."
+          }
       - name: Prepare Windows signing certificate
         id: windows_signing
         env:
@@ -160,11 +175,14 @@ jobs:
           Copy-Item target\x86_64-pc-windows-msvc\release\resource_monitor.exe dist\portable\ResourceMonitor\ResourceMonitor.exe
           Copy-Item README.md dist\portable\ResourceMonitor\README.md
           Copy-Item vendor\sensor-support dist\portable\ResourceMonitor\sensor-support -Recurse
+          New-Item -ItemType Directory -Force -Path dist\portable\ResourceMonitor\tools | Out-Null
+          Copy-Item vendor\presentmon\PresentMon.exe dist\portable\ResourceMonitor\tools\PresentMon.exe
+          Copy-Item vendor\presentmon\LICENSE.txt dist\portable\ResourceMonitor\tools\PresentMon-LICENSE.txt
           Compress-Archive -Path dist\portable\ResourceMonitor -DestinationPath "dist\ResourceMonitor-${{ needs.prepare.outputs.version }}-Windows-Portable.zip"
       - name: Build Windows installer
         shell: pwsh
         run: |
-          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" "/DAppVersion=${{ needs.prepare.outputs.version }}" "/DSourceExe=$pwd\target\x86_64-pc-windows-msvc\release\resource_monitor.exe" packaging\windows\resource-monitor.iss
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" "/DAppVersion=${{ needs.prepare.outputs.version }}" "/DSourceExe=$pwd\target\x86_64-pc-windows-msvc\release\resource_monitor.exe" "/DPresentMonDir=$pwd\vendor\presentmon" packaging\windows\resource-monitor.iss
       - name: Sign Windows installer
         if: ${{ steps.windows_signing.outputs.enabled == 'true' }}
         env:

@@ -1,10 +1,19 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
-use std::collections::VecDeque;
+mod config;
+mod monitors;
+mod presentmon;
+mod steam;
+mod updater;
+
+use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, VecDeque};
 #[cfg(target_os = "windows")]
 use std::ffi::c_void;
 #[cfg(target_os = "macos")]
 use std::ffi::{c_char, c_void};
+use std::io::Read;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 #[cfg(target_os = "macos")]
 use std::sync::OnceLock;
@@ -25,13 +34,20 @@ use tray_icon::{
     menu::{Menu, MenuEvent, MenuId, MenuItem},
 };
 
+use monitors::set_popup_position as set_windows_popup_position;
+use monitors::{areas as monitor_areas, popup_position as popup_screen_position};
+use steam::{Game as SteamGame, ItemKind as SteamItemKind, ScanResult as SteamScanResult};
+use steam::{SelectionMode as SteamSelectionMode, Settings as SteamSettings};
+use steam::{
+    encode as encode_steam_settings, load as load_steam_settings, save as save_steam_settings,
+};
+
 const BLUE: Color32 = Color32::from_rgb(92, 145, 255);
 const GREEN: Color32 = Color32::from_rgb(68, 196, 130);
 const PURPLE: Color32 = Color32::from_rgb(170, 112, 255);
 const ORANGE: Color32 = Color32::from_rgb(246, 162, 74);
 const HISTORY: usize = 60;
 const UPDATE_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
-const RELEASE_API: &str = "https://api.github.com/repos/Mobil0010/resource_monitor/releases/latest";
 
 #[cfg(target_os = "macos")]
 static MAC_REOPEN_REQUESTED: AtomicBool = AtomicBool::new(false);
@@ -92,11 +108,12 @@ enum Page {
     Disks,
     Processes,
     Network,
+    GameIntegration,
     Settings,
 }
 
 impl Page {
-    const ALL: [Self; 8] = [
+    const ALL: [Self; 9] = [
         Self::Overview,
         Self::Cpu,
         Self::Gpu,
@@ -104,6 +121,7 @@ impl Page {
         Self::Disks,
         Self::Processes,
         Self::Network,
+        Self::GameIntegration,
         Self::Settings,
     ];
     fn key(self) -> &'static str {
@@ -115,6 +133,7 @@ impl Page {
             Self::Disks => "disks",
             Self::Processes => "processes",
             Self::Network => "network",
+            Self::GameIntegration => "game_integration",
             Self::Settings => "settings",
         }
     }
@@ -151,7 +170,7 @@ impl Language {
     }
 }
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Serialize, Deserialize)]
 enum PopupPosition {
     TopLeft,
     TopCenter,
@@ -194,11 +213,33 @@ impl PopupPosition {
     }
 }
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Serialize, Deserialize)]
 enum PopupSize {
     Small,
     Medium,
     Large,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct PopupProfile {
+    position: PopupPosition,
+    monitor: usize,
+    size: PopupSize,
+    shown: [bool; 6],
+    opacity: f32,
+    graphs: bool,
+    refresh_secs: u64,
+}
+
+impl PopupProfile {
+    fn sanitize(&mut self) {
+        self.opacity = if self.opacity.is_finite() {
+            self.opacity.clamp(0.0, 1.0)
+        } else {
+            0.92
+        };
+        self.refresh_secs = self.refresh_secs.clamp(1, 10);
+    }
 }
 
 impl PopupSize {
@@ -234,190 +275,6 @@ impl PopupSize {
             .unwrap_or(1) as u8
     }
 }
-
-#[derive(Clone, Copy)]
-struct MonitorArea {
-    left: f32,
-    top: f32,
-    width: f32,
-    height: f32,
-}
-
-#[cfg(target_os = "windows")]
-#[repr(C)]
-struct WinRect {
-    left: i32,
-    top: i32,
-    right: i32,
-    bottom: i32,
-}
-
-#[cfg(target_os = "windows")]
-#[repr(C)]
-struct WinMonitorInfo {
-    size: u32,
-    monitor: WinRect,
-    work: WinRect,
-    flags: u32,
-}
-
-#[cfg(target_os = "windows")]
-#[link(name = "user32")]
-unsafe extern "system" {
-    fn EnumDisplayMonitors(
-        dc: *mut c_void,
-        clip: *const WinRect,
-        callback: unsafe extern "system" fn(*mut c_void, *mut c_void, *mut WinRect, isize) -> i32,
-        data: isize,
-    ) -> i32;
-    fn GetMonitorInfoW(monitor: *mut c_void, info: *mut WinMonitorInfo) -> i32;
-    fn FindWindowW(class_name: *const u16, window_name: *const u16) -> *mut c_void;
-    fn ShowWindow(window: *mut c_void, command: i32) -> i32;
-    fn SetForegroundWindow(window: *mut c_void) -> i32;
-    fn GetWindowRect(window: *mut c_void, rect: *mut WinRect) -> i32;
-    fn SetWindowPos(
-        window: *mut c_void,
-        insert_after: *mut c_void,
-        x: i32,
-        y: i32,
-        width: i32,
-        height: i32,
-        flags: u32,
-    ) -> i32;
-}
-
-#[cfg(target_os = "windows")]
-unsafe extern "system" fn collect_monitor(
-    monitor: *mut c_void,
-    _: *mut c_void,
-    _: *mut WinRect,
-    data: isize,
-) -> i32 {
-    let mut info = WinMonitorInfo {
-        size: std::mem::size_of::<WinMonitorInfo>() as u32,
-        monitor: WinRect {
-            left: 0,
-            top: 0,
-            right: 0,
-            bottom: 0,
-        },
-        work: WinRect {
-            left: 0,
-            top: 0,
-            right: 0,
-            bottom: 0,
-        },
-        flags: 0,
-    };
-    if unsafe { GetMonitorInfoW(monitor, &mut info) } != 0 {
-        let monitors = unsafe { &mut *(data as *mut Vec<(bool, MonitorArea)>) };
-        monitors.push((
-            info.flags & 1 != 0,
-            MonitorArea {
-                left: info.work.left as f32,
-                top: info.work.top as f32,
-                width: (info.work.right - info.work.left) as f32,
-                height: (info.work.bottom - info.work.top) as f32,
-            },
-        ));
-    }
-    1
-}
-
-fn monitor_areas(ctx: &egui::Context) -> Vec<MonitorArea> {
-    #[cfg(target_os = "windows")]
-    {
-        let mut found: Vec<(bool, MonitorArea)> = Vec::new();
-        unsafe {
-            EnumDisplayMonitors(
-                std::ptr::null_mut(),
-                std::ptr::null(),
-                collect_monitor,
-                &mut found as *mut _ as isize,
-            );
-        }
-        found.sort_by(|a, b| {
-            b.0.cmp(&a.0)
-                .then_with(|| a.1.left.total_cmp(&b.1.left))
-                .then_with(|| a.1.top.total_cmp(&b.1.top))
-        });
-        if !found.is_empty() {
-            return found.into_iter().map(|(_, area)| area).collect();
-        }
-    }
-    let size = ctx
-        .input(|i| i.viewport().monitor_size)
-        .unwrap_or(Vec2::new(1920.0, 1080.0));
-    vec![MonitorArea {
-        left: 0.0,
-        top: 0.0,
-        width: size.x,
-        height: size.y,
-    }]
-}
-
-fn popup_screen_position(area: MonitorArea, size: Vec2, position: PopupPosition) -> [f32; 2] {
-    let margin = 18.0;
-    let top = area.top
-        + if cfg!(target_os = "macos") {
-            42.0
-        } else {
-            margin
-        };
-    let bottom = area.top + area.height - size.y - margin;
-    let left = area.left + margin;
-    let center = area.left + (area.width - size.x) / 2.0;
-    let right = area.left + area.width - size.x - margin;
-    match position {
-        PopupPosition::TopLeft => [left, top],
-        PopupPosition::TopCenter => [center, top],
-        PopupPosition::TopRight => [right, top],
-        PopupPosition::BottomLeft => [left, bottom],
-        PopupPosition::BottomCenter => [center, bottom],
-        PopupPosition::BottomRight => [right, bottom],
-    }
-}
-
-#[cfg(target_os = "windows")]
-fn set_windows_popup_position(area: MonitorArea, position: PopupPosition) {
-    const SWP_NOSIZE: u32 = 0x0001;
-    const SWP_NOZORDER: u32 = 0x0004;
-    const SWP_NOACTIVATE: u32 = 0x0010;
-    let title: Vec<u16> = "Resource Monitor Popup\0".encode_utf16().collect();
-    unsafe {
-        let window = FindWindowW(std::ptr::null(), title.as_ptr());
-        let mut rect = WinRect {
-            left: 0,
-            top: 0,
-            right: 0,
-            bottom: 0,
-        };
-        if window.is_null() || GetWindowRect(window, &mut rect) == 0 {
-            return;
-        }
-        let size = Vec2::new(
-            (rect.right - rect.left) as f32,
-            (rect.bottom - rect.top) as f32,
-        );
-        let [x, y] = popup_screen_position(area, size, position);
-        let x = x.round() as i32;
-        let y = y.round() as i32;
-        if rect.left != x || rect.top != y {
-            SetWindowPos(
-                window,
-                std::ptr::null_mut(),
-                x,
-                y,
-                0,
-                0,
-                SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
-            );
-        }
-    }
-}
-
-#[cfg(not(target_os = "windows"))]
-fn set_windows_popup_position(_: MonitorArea, _: PopupPosition) {}
 
 struct GpuInfo {
     name: String,
@@ -691,6 +548,23 @@ struct App {
     settings_message: Option<String>,
     refresh_secs: u64,
     saved_settings: String,
+    steam: SteamSettings,
+    saved_steam_settings: String,
+    steam_games: Vec<SteamGame>,
+    steam_scan_rx: Option<Receiver<SteamScanResult>>,
+    steam_picker_rx: Option<Receiver<Option<PathBuf>>>,
+    steam_executable_picker_rx: Option<(u32, Receiver<Option<PathBuf>>)>,
+    steam_scan_message: Option<String>,
+    steam_running_order: Vec<u32>,
+    steam_last_check: Instant,
+    steam_edit_game: Option<u32>,
+    steam_icon_textures: HashMap<u32, egui::TextureHandle>,
+    steam_popup_suppressed: bool,
+    steam_active_pid: Option<u32>,
+    steam_perf_rx: Option<Receiver<Option<(f32, f32)>>>,
+    steam_perf_last: Instant,
+    steam_fps: Option<f32>,
+    steam_frame_time: Option<f32>,
     update_rx: Option<Receiver<Option<UpdateInfo>>>,
     last_update_check: Instant,
     available_update: Option<UpdateInfo>,
@@ -710,12 +584,10 @@ struct TrayState {
     quit_id: MenuId,
 }
 
-#[derive(Clone, Debug, PartialEq)]
-struct UpdateInfo {
-    version: String,
-    asset_url: String,
-    asset_name: String,
-}
+use config::{
+    popup_file as popup_config_file, save as save_settings, settings_file, shutdown_file,
+};
+use updater::UpdateInfo;
 
 #[derive(Clone)]
 struct SavedSettings {
@@ -886,9 +758,27 @@ impl App {
         let dark = settings.dark;
         set_style(&cc.egui_ctx, dark);
         let saved_settings = settings.encode();
-        let update_rx = Some(start_update_check(cc.egui_ctx.clone()));
+        let update_rx = Some(updater::start_check(cc.egui_ctx.clone()));
         #[cfg(target_os = "windows")]
         let tray = create_tray_icon();
+        let base_popup_profile = PopupProfile {
+            position: settings.popup_position,
+            monitor: settings.popup_monitor,
+            size: settings.popup_size,
+            shown: [
+                settings.popup_cpu,
+                settings.popup_gpu,
+                settings.popup_memory,
+                settings.popup_disk,
+                settings.popup_processes,
+                settings.popup_network,
+            ],
+            opacity: settings.popup_opacity,
+            graphs: settings.popup_graphs,
+            refresh_secs: settings.refresh_secs,
+        };
+        let steam = load_steam_settings(base_popup_profile);
+        let saved_steam_settings = encode_steam_settings(&steam).unwrap_or_default();
         let mut app = Self {
             sys: System::new(),
             components: Components::new_with_refreshed_list(),
@@ -928,6 +818,23 @@ impl App {
             settings_message: None,
             refresh_secs: settings.refresh_secs,
             saved_settings,
+            steam,
+            saved_steam_settings,
+            steam_games: Vec::new(),
+            steam_scan_rx: None,
+            steam_picker_rx: None,
+            steam_executable_picker_rx: None,
+            steam_scan_message: None,
+            steam_running_order: Vec::new(),
+            steam_last_check: Instant::now() - Duration::from_secs(2),
+            steam_edit_game: None,
+            steam_icon_textures: HashMap::new(),
+            steam_popup_suppressed: false,
+            steam_active_pid: None,
+            steam_perf_rx: None,
+            steam_perf_last: Instant::now() - Duration::from_secs(10),
+            steam_fps: None,
+            steam_frame_time: None,
             update_rx,
             last_update_check: Instant::now(),
             available_update: None,
@@ -939,6 +846,9 @@ impl App {
             #[cfg(target_os = "windows")]
             tray,
         };
+        if app.steam.enabled {
+            app.start_steam_scan(cc.egui_ctx.clone());
+        }
         app.refresh();
         app
     }
@@ -981,6 +891,207 @@ impl App {
         }
     }
 
+    fn normal_popup_profile(&self) -> PopupProfile {
+        PopupProfile {
+            position: self.popup_position,
+            monitor: self.popup_monitor,
+            size: self.popup_size,
+            shown: [
+                self.popup_cpu,
+                self.popup_gpu,
+                self.popup_memory,
+                self.popup_disk,
+                self.popup_processes,
+                self.popup_network,
+            ],
+            opacity: self.popup_opacity,
+            graphs: self.popup_graphs,
+            refresh_secs: self.refresh_secs,
+        }
+    }
+
+    fn active_steam_game(&self) -> Option<u32> {
+        self.steam_running_order.last().copied()
+    }
+
+    fn effective_popup_profile(&self) -> PopupProfile {
+        if let Some(app_id) = self.active_steam_game() {
+            if let Some(profile) = self.steam.game_profiles.get(&app_id) {
+                return profile.clone();
+            }
+            if self.steam.use_custom_profile {
+                return self.steam.common_profile.clone();
+            }
+        }
+        self.normal_popup_profile()
+    }
+
+    fn effective_popup_visible(&self) -> bool {
+        if self.active_steam_game().is_some() {
+            !self.steam_popup_suppressed
+        } else {
+            self.popup
+        }
+    }
+
+    fn save_steam_settings_if_changed(&mut self) {
+        let Ok(value) = encode_steam_settings(&self.steam) else {
+            return;
+        };
+        if value == self.saved_steam_settings {
+            return;
+        }
+        match save_steam_settings(&value) {
+            Ok(()) => {
+                self.saved_steam_settings = value;
+                self.settings_message = None;
+            }
+            Err(error) => self.settings_message = Some(error),
+        }
+    }
+
+    fn start_steam_scan(&mut self, ctx: egui::Context) {
+        self.steam_scan_message = Some(tr(self.language, "steam_scanning").to_owned());
+        self.steam_scan_rx = Some(scan_steam_libraries(
+            self.steam.manual_libraries.clone(),
+            self.language,
+            ctx,
+        ));
+    }
+
+    fn poll_steam(&mut self, ctx: &egui::Context) {
+        if let Some(receiver) = &self.steam_scan_rx {
+            match receiver.try_recv() {
+                Ok(result) => {
+                    self.steam_games = result.games;
+                    self.steam_scan_message = Some(result.message);
+                    self.steam_scan_rx = None;
+                    for library in result.libraries {
+                        if !self.steam.manual_libraries.contains(&library)
+                            && !is_default_steam_library(&library)
+                        {
+                            self.steam.manual_libraries.push(library);
+                        }
+                    }
+                }
+                Err(TryRecvError::Disconnected) => {
+                    self.steam_scan_message =
+                        Some(tr(self.language, "steam_scan_failed").to_owned());
+                    self.steam_scan_rx = None;
+                }
+                Err(TryRecvError::Empty) => {}
+            }
+        }
+        if let Some(receiver) = &self.steam_picker_rx {
+            match receiver.try_recv() {
+                Ok(Some(path)) => {
+                    if validate_steam_library(&path) {
+                        if !self.steam.manual_libraries.contains(&path) {
+                            self.steam.manual_libraries.push(path);
+                        }
+                        self.steam.enabled = true;
+                        self.steam_picker_rx = None;
+                        self.start_steam_scan(ctx.clone());
+                    } else {
+                        self.steam_scan_message =
+                            Some(tr(self.language, "steam_invalid_library").to_owned());
+                        self.steam_picker_rx = None;
+                    }
+                }
+                Ok(None) | Err(TryRecvError::Disconnected) => self.steam_picker_rx = None,
+                Err(TryRecvError::Empty) => {}
+            }
+        }
+        if let Some((app_id, receiver)) = &self.steam_executable_picker_rx {
+            match receiver.try_recv() {
+                Ok(Some(path)) => {
+                    self.steam
+                        .manual_executables
+                        .entry(*app_id)
+                        .or_default()
+                        .push(path);
+                    self.steam_executable_picker_rx = None;
+                }
+                Ok(None) | Err(TryRecvError::Disconnected) => {
+                    self.steam_executable_picker_rx = None
+                }
+                Err(TryRecvError::Empty) => {}
+            }
+        }
+        if !self.steam.enabled
+            || self.steam_games.is_empty()
+            || self.steam_last_check.elapsed() < Duration::from_secs(1)
+        {
+            return;
+        }
+        self.steam_last_check = Instant::now();
+        self.sys.refresh_processes(ProcessesToUpdate::All, true);
+        let previous_active = self.active_steam_game();
+        let mut running = Vec::new();
+        for game in &self.steam_games {
+            if game.kind == SteamItemKind::Other && !self.steam.include_other {
+                continue;
+            }
+            if self.steam.selection_mode == SteamSelectionMode::Selected
+                && !self.steam.selected_games.contains(&game.app_id)
+            {
+                continue;
+            }
+            if let Some(pid) = steam_game_pid(
+                game,
+                self.steam.manual_executables.get(&game.app_id),
+                &self.sys,
+            ) {
+                running.push((game.app_id, pid));
+            }
+        }
+        self.steam_running_order
+            .retain(|id| running.iter().any(|(running_id, _)| running_id == id));
+        for (id, _) in &running {
+            if !self.steam_running_order.contains(&id) {
+                self.steam_running_order.push(*id);
+            }
+        }
+        self.steam_active_pid = self.active_steam_game().and_then(|active| {
+            running
+                .iter()
+                .find(|(id, _)| *id == active)
+                .map(|(_, pid)| *pid)
+        });
+        if previous_active != self.active_steam_game() {
+            self.steam_fps = None;
+            self.steam_frame_time = None;
+            self.steam_perf_rx = None;
+            self.steam_perf_last = Instant::now() - Duration::from_secs(10);
+        }
+        if self.steam_running_order.is_empty() {
+            self.steam_popup_suppressed = false;
+            self.steam_active_pid = None;
+            self.steam_fps = None;
+            self.steam_frame_time = None;
+        }
+        if let Some(receiver) = &self.steam_perf_rx {
+            match receiver.try_recv() {
+                Ok(Some((fps, frame_time))) => {
+                    self.steam_fps = Some(fps);
+                    self.steam_frame_time = Some(frame_time);
+                    self.steam_perf_rx = None;
+                }
+                Ok(None) | Err(TryRecvError::Disconnected) => self.steam_perf_rx = None,
+                Err(TryRecvError::Empty) => {}
+            }
+        }
+        if (self.steam.show_fps || self.steam.show_frame_time)
+            && self.steam_perf_rx.is_none()
+            && self.steam_perf_last.elapsed() >= Duration::from_secs(3)
+            && let Some(pid) = self.steam_active_pid
+            && let Some(tool) = presentmon::find()
+        {
+            self.steam_perf_last = Instant::now();
+            self.steam_perf_rx = Some(presentmon::sample(tool, pid, ctx.clone()));
+        }
+    }
+
     fn poll_update_check(&mut self, ctx: &egui::Context) {
         if let Some(receiver) = &self.update_rx {
             match receiver.try_recv() {
@@ -995,7 +1106,7 @@ impl App {
             }
         }
         if self.update_rx.is_none() && self.last_update_check.elapsed() >= UPDATE_INTERVAL {
-            self.update_rx = Some(start_update_check(ctx.clone()));
+            self.update_rx = Some(updater::start_check(ctx.clone()));
             self.last_update_check = Instant::now();
         }
     }
@@ -1030,18 +1141,26 @@ impl App {
             self.temperature_monitor.request_refresh();
             self.last_temperature_refresh = Instant::now();
         }
-        let popup_visible = self.popup;
-        if self.page == Page::Processes || (popup_visible && self.popup_processes) {
+        let popup_visible = self.effective_popup_visible();
+        let popup_profile = self.effective_popup_profile();
+        if self.page == Page::Processes
+            || (popup_visible && popup_profile.shown[4])
+            || self.steam.enabled
+        {
             self.sys.refresh_processes(ProcessesToUpdate::All, true);
         }
-        if matches!(self.page, Page::Overview | Page::Gpu) || (popup_visible && self.popup_gpu) {
+        if matches!(self.page, Page::Overview | Page::Gpu)
+            || (popup_visible && popup_profile.shown[1])
+        {
             self.gpu.refresh();
         }
-        if matches!(self.page, Page::Overview | Page::Disks) || (popup_visible && self.popup_disk) {
+        if matches!(self.page, Page::Overview | Page::Disks)
+            || (popup_visible && popup_profile.shown[3])
+        {
             self.disks.refresh(true);
         }
         if matches!(self.page, Page::Overview | Page::Network)
-            || (popup_visible && self.popup_network)
+            || (popup_visible && popup_profile.shown[5])
         {
             self.networks.refresh(true);
         }
@@ -1561,6 +1680,283 @@ impl App {
         });
     }
 
+    fn game_integration_page(&mut self, ui: &mut egui::Ui) {
+        let lang = self.language;
+        card(ui, |ui| {
+            ui.label(
+                RichText::new(tr(lang, "steam_link_title"))
+                    .strong()
+                    .size(17.0),
+            );
+            ui.label(RichText::new(tr(lang, "steam_link_description")).weak());
+            ui.add_space(12.0);
+            ui.horizontal_wrapped(|ui| {
+                if ui.button(tr(lang, "steam_auto_find")).clicked() {
+                    self.steam.enabled = true;
+                    self.start_steam_scan(ui.ctx().clone());
+                }
+                if ui.button(tr(lang, "steam_manual_library")).clicked() {
+                    self.steam_picker_rx = Some(pick_path(true, ui.ctx().clone()));
+                }
+                if self.steam.enabled && ui.button(tr(lang, "steam_rescan")).clicked() {
+                    self.start_steam_scan(ui.ctx().clone());
+                }
+                if self.steam.enabled && ui.button(tr(lang, "steam_disconnect")).clicked() {
+                    self.steam.enabled = false;
+                    self.steam_running_order.clear();
+                    self.steam_games.clear();
+                }
+            });
+            if let Some(message) = &self.steam_scan_message {
+                ui.add_space(8.0);
+                ui.label(RichText::new(message).weak().size(12.0));
+            }
+        });
+        if !self.steam.enabled {
+            return;
+        }
+
+        ui.add_space(12.0);
+        card(ui, |ui| {
+            ui.label(
+                RichText::new(tr(lang, "steam_trigger_title"))
+                    .strong()
+                    .size(15.0),
+            );
+            ui.label(RichText::new(tr(lang, "steam_trigger_description")).weak());
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                ui.radio_value(
+                    &mut self.steam.selection_mode,
+                    SteamSelectionMode::All,
+                    tr(lang, "steam_all_games"),
+                );
+                ui.radio_value(
+                    &mut self.steam.selection_mode,
+                    SteamSelectionMode::Selected,
+                    tr(lang, "steam_selected_games"),
+                );
+            });
+            ui.add_space(8.0);
+            ui.checkbox(
+                &mut self.steam.include_other,
+                tr(lang, "steam_include_other"),
+            );
+            ui.label(
+                RichText::new(tr(lang, "steam_include_other_description"))
+                    .weak()
+                    .size(11.0),
+            );
+        });
+
+        ui.add_space(12.0);
+        card(ui, |ui| {
+            ui.label(
+                RichText::new(tr(lang, "steam_popup_title"))
+                    .strong()
+                    .size(15.0),
+            );
+            ui.label(RichText::new(tr(lang, "steam_popup_description")).weak());
+            ui.add_space(10.0);
+            if ui
+                .checkbox(
+                    &mut self.steam.use_custom_profile,
+                    tr(lang, "steam_custom_popup"),
+                )
+                .changed()
+                && self.steam.use_custom_profile
+            {
+                self.steam.common_profile = self.normal_popup_profile();
+            }
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut self.steam.show_fps, "FPS");
+                ui.checkbox(&mut self.steam.show_frame_time, tr(lang, "frame_time"));
+            });
+            ui.label(
+                RichText::new(tr(lang, "presentmon_explanation"))
+                    .weak()
+                    .size(11.0),
+            );
+        });
+        if self.steam.use_custom_profile {
+            ui.add_space(12.0);
+            popup_profile_editor(ui, &mut self.steam.common_profile, lang, "steam_common");
+        }
+
+        ui.add_space(12.0);
+        card(ui, |ui| {
+            ui.label(
+                RichText::new(tr(lang, "steam_games_title"))
+                    .strong()
+                    .size(15.0),
+            );
+            ui.label(RichText::new(tr(lang, "steam_games_description")).weak());
+            ui.add_space(10.0);
+            if self.steam_games.is_empty() {
+                ui.label(tr(lang, "steam_no_games"));
+                return;
+            }
+            let games: Vec<_> = self
+                .steam_games
+                .iter()
+                .map(|game| {
+                    (
+                        game.app_id,
+                        game.name.clone(),
+                        game.install_dir.clone(),
+                        game.icon.clone(),
+                        game.kind,
+                    )
+                })
+                .collect();
+            for (kind, heading) in [
+                (SteamItemKind::Game, tr(lang, "steam_games_group")),
+                (SteamItemKind::Other, tr(lang, "steam_other_group")),
+            ] {
+                let count = games.iter().filter(|game| game.4 == kind).count();
+                if count == 0 {
+                    continue;
+                }
+                ui.add_space(6.0);
+                ui.label(
+                    RichText::new(format!("{heading} ({count})"))
+                        .strong()
+                        .color(if kind == SteamItemKind::Game {
+                            GREEN
+                        } else {
+                            ORANGE
+                        }),
+                );
+                ui.add_space(4.0);
+                for (app_id, name, install_dir, icon, _) in
+                    games.iter().filter(|game| game.4 == kind)
+                {
+                    ui.horizontal(|ui| {
+                        if let Some(texture) = steam_icon_texture(
+                            &mut self.steam_icon_textures,
+                            ui.ctx(),
+                            *app_id,
+                            icon.as_deref(),
+                        ) {
+                            ui.image((texture.id(), Vec2::splat(38.0)));
+                        } else {
+                            let (rect, _) =
+                                ui.allocate_exact_size(Vec2::splat(38.0), Sense::hover());
+                            ui.painter()
+                                .rect_filled(rect, 6.0, Color32::from_rgb(38, 45, 57));
+                            ui.painter().text(
+                                rect.center(),
+                                Align2::CENTER_CENTER,
+                                "🎮",
+                                FontId::proportional(18.0),
+                                Color32::WHITE,
+                            );
+                        }
+                        ui.vertical(|ui| {
+                            ui.label(RichText::new(name.as_str()).strong());
+                            ui.label(
+                                RichText::new(format!(
+                                    "App ID {app_id}  ·  {}",
+                                    install_dir.display()
+                                ))
+                                .weak()
+                                .size(10.0),
+                            );
+                        });
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            let selected = self.steam.selected_games.contains(app_id);
+                            let mut enabled = selected;
+                            if ui
+                                .checkbox(&mut enabled, tr(lang, "steam_use_game"))
+                                .changed()
+                            {
+                                if enabled {
+                                    self.steam.selected_games.insert(*app_id);
+                                } else {
+                                    self.steam.selected_games.remove(app_id);
+                                }
+                            }
+                            if ui
+                                .selectable_label(
+                                    self.steam_edit_game == Some(*app_id),
+                                    tr(lang, "steam_game_settings"),
+                                )
+                                .clicked()
+                            {
+                                self.steam_edit_game = if self.steam_edit_game == Some(*app_id) {
+                                    None
+                                } else {
+                                    Some(*app_id)
+                                };
+                            }
+                        });
+                    });
+                    ui.separator();
+                }
+            }
+        });
+
+        if let Some(app_id) = self.steam_edit_game {
+            let game_name = self
+                .steam_games
+                .iter()
+                .find(|g| g.app_id == app_id)
+                .map(|g| g.name.clone())
+                .unwrap_or_else(|| app_id.to_string());
+            ui.add_space(12.0);
+            card(ui, |ui| {
+                ui.label(
+                    RichText::new(format!(
+                        "{} — {}",
+                        game_name,
+                        tr(lang, "steam_game_settings")
+                    ))
+                    .strong()
+                    .size(15.0),
+                );
+                ui.label(RichText::new(tr(lang, "steam_game_settings_description")).weak());
+                ui.add_space(8.0);
+                let mut custom = self.steam.game_profiles.contains_key(&app_id);
+                if ui
+                    .checkbox(&mut custom, tr(lang, "steam_game_custom_popup"))
+                    .changed()
+                {
+                    if custom {
+                        let base = if self.steam.use_custom_profile {
+                            self.steam.common_profile.clone()
+                        } else {
+                            self.normal_popup_profile()
+                        };
+                        self.steam.game_profiles.insert(app_id, base);
+                    } else {
+                        self.steam.game_profiles.remove(&app_id);
+                    }
+                }
+                if ui.button(tr(lang, "steam_add_executable")).clicked() {
+                    self.steam_executable_picker_rx =
+                        Some((app_id, pick_path(false, ui.ctx().clone())));
+                }
+                let executable_count = self
+                    .steam
+                    .manual_executables
+                    .get(&app_id)
+                    .map_or(0, Vec::len);
+                ui.label(
+                    RichText::new(format!(
+                        "{}: {executable_count}",
+                        tr(lang, "steam_manual_executables")
+                    ))
+                    .weak()
+                    .size(11.0),
+                );
+            });
+            if let Some(profile) = self.steam.game_profiles.get_mut(&app_id) {
+                ui.add_space(12.0);
+                popup_profile_editor(ui, profile, lang, &format!("steam_game_{app_id}"));
+            }
+        }
+    }
+
     fn settings_page(&mut self, ui: &mut egui::Ui) {
         let lang = self.language;
         card(ui, |ui| {
@@ -1704,21 +2100,19 @@ impl App {
 
     fn show_popup(&mut self, ctx: &egui::Context) {
         if self.popup_closed.swap(false, Ordering::Relaxed) {
-            self.popup = false;
+            if self.active_steam_game().is_some() {
+                self.steam_popup_suppressed = true;
+            } else {
+                self.popup = false;
+            }
         }
-        if !self.popup {
+        if !self.effective_popup_visible() {
             return;
         }
-        let popup_scale = self.popup_size.scale();
+        let profile = self.effective_popup_profile();
+        let popup_scale = profile.size.scale();
         let width = 292.0 * popup_scale;
-        let shown = [
-            self.popup_cpu,
-            self.popup_gpu,
-            self.popup_memory,
-            self.popup_disk,
-            self.popup_processes,
-            self.popup_network,
-        ];
+        let shown = profile.shown;
         let count = shown.into_iter().filter(|shown| *shown).count().max(1);
         let mut temperatures = metric_temperatures(&self.components);
         temperatures[0] = self.temperature_monitor.values.cpu.or(temperatures[0]);
@@ -1729,16 +2123,23 @@ impl App {
             .into_iter()
             .filter(|index| shown[*index])
             .count();
-        let graph_rows = if self.popup_graphs {
+        let steam_performance_rows = if self.active_steam_game().is_some() {
+            usize::from(self.steam.show_fps) + usize::from(self.steam.show_frame_time)
+        } else {
+            0
+        };
+        let graph_rows = if profile.graphs {
             graph_count.div_ceil(2)
         } else {
             0
         };
-        let height = (48.0 + count as f32 * 31.0 + graph_rows as f32 * 76.0) * popup_scale;
+        let height =
+            (48.0 + (count + steam_performance_rows) as f32 * 31.0 + graph_rows as f32 * 76.0)
+                * popup_scale;
         let monitors = monitor_areas(ctx);
-        self.popup_monitor = self.popup_monitor.min(monitors.len().saturating_sub(1));
-        let monitor_area = monitors[self.popup_monitor];
-        let popup_position = self.popup_position;
+        let popup_monitor = profile.monitor.min(monitors.len().saturating_sub(1));
+        let monitor_area = monitors[popup_monitor];
+        let popup_position = profile.position;
         let position =
             popup_screen_position(monitor_area, Vec2::new(width, height), popup_position);
         let disk_total: u64 = self.disks.iter().map(|d| d.total_space()).sum();
@@ -1770,9 +2171,9 @@ impl App {
             self.down.clone(),
         ];
         let dark = self.dark;
-        let opacity = self.popup_opacity;
+        let opacity = profile.opacity;
         let lang = self.language;
-        let graphs = self.popup_graphs;
+        let graphs = profile.graphs;
         let scale = popup_scale;
         let builder = egui::ViewportBuilder::default()
             .with_title("Resource Monitor Popup")
@@ -1788,7 +2189,17 @@ impl App {
         // 부모 창의 최소화/복원 중에도 팝업은 별도의 렌더링 콜백을 사용합니다.
         // 작은 읽기 전용 스냅샷을 전달하여 UI 사이에 잠금이나 중첩 렌더링이 없습니다.
         let popup_closed = Arc::clone(&self.popup_closed);
-        let refresh_interval = Duration::from_secs(self.refresh_secs);
+        let refresh_interval = Duration::from_secs(profile.refresh_secs);
+        let show_fps = self.active_steam_game().is_some() && self.steam.show_fps;
+        let show_frame_time = self.active_steam_game().is_some() && self.steam.show_frame_time;
+        let fps_text = self
+            .steam_fps
+            .map(|value| format!("{value:.0}"))
+            .unwrap_or_else(|| tr(self.language, "presentmon_required").to_owned());
+        let frame_time_text = self
+            .steam_frame_time
+            .map(|value| format!("{value:.1} ms"))
+            .unwrap_or_else(|| tr(self.language, "presentmon_required").to_owned());
         ctx.show_viewport_deferred(
             egui::ViewportId::from_hash_of("monitor_popup"),
             builder,
@@ -1850,6 +2261,12 @@ impl App {
                                 }
                                 popup_row(ui, labels[index], &value, colors[index], scale);
                             }
+                        }
+                        if show_fps {
+                            popup_row(ui, "FPS", &fps_text, BLUE, scale);
+                        }
+                        if show_frame_time {
+                            popup_row(ui, tr(lang, "frame_time"), &frame_time_text, PURPLE, scale);
                         }
                         if graphs {
                             ui.add_space(6.0);
@@ -1986,6 +2403,7 @@ impl eframe::App for App {
         self.handle_tray_events(ctx);
         self.poll_update_check(ctx);
         self.poll_update_download();
+        self.poll_steam(ctx);
         ctx.request_repaint_after(if cfg!(target_os = "windows") {
             Duration::from_millis(250)
         } else {
@@ -2005,7 +2423,7 @@ impl eframe::App for App {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
         }
-        if self.last.elapsed() >= Duration::from_secs(self.refresh_secs) {
+        if self.last.elapsed() >= Duration::from_secs(self.effective_popup_profile().refresh_secs) {
             self.refresh();
         }
         #[cfg(target_os = "macos")]
@@ -2119,14 +2537,14 @@ impl eframe::App for App {
                             {
                                 self.update_download_error = None;
                                 self.update_download_rx =
-                                    Some(start_update_download(update.clone(), ui.ctx().clone()));
+                                    Some(updater::start_download(update.clone(), ui.ctx().clone()));
                             }
                             if self.update_download_error.is_some()
                                 && ui.button(tr(self.language, "update_retry")).clicked()
                             {
                                 self.update_download_error = None;
                                 self.update_download_rx =
-                                    Some(start_update_download(update.clone(), ui.ctx().clone()));
+                                    Some(updater::start_download(update.clone(), ui.ctx().clone()));
                             }
                         });
                     });
@@ -2156,6 +2574,7 @@ impl eframe::App for App {
                         Page::Disks => self.disks_page(ui),
                         Page::Processes => self.processes_page(ui),
                         Page::Network => self.network_page(ui),
+                        Page::GameIntegration => self.game_integration_page(ui),
                         Page::Settings => self.settings_page(ui),
                     });
             });
@@ -2187,8 +2606,10 @@ impl eframe::App for App {
             }
         }
         self.save_settings_if_changed();
+        self.save_steam_settings_if_changed();
+        let effective_refresh = self.effective_popup_profile().refresh_secs;
         ctx.request_repaint_after(
-            Duration::from_secs(self.refresh_secs).saturating_sub(self.last.elapsed()),
+            Duration::from_secs(effective_refresh).saturating_sub(self.last.elapsed()),
         );
     }
 
@@ -2516,197 +2937,12 @@ fn mini_chart(ui: &mut egui::Ui, label: &str, values: &VecDeque<f32>, color: Col
     }
 }
 
-fn shutdown_file() -> std::path::PathBuf {
-    std::env::temp_dir().join("resource_monitor.shutdown")
-}
-
-fn popup_config_file() -> std::path::PathBuf {
-    std::env::temp_dir().join("resource_monitor.popup.conf")
-}
-
 fn parse_bool(value: &str) -> Option<bool> {
     match value.trim() {
         "1" | "true" => Some(true),
         "0" | "false" => Some(false),
         _ => None,
     }
-}
-
-fn settings_file() -> std::path::PathBuf {
-    #[cfg(target_os = "macos")]
-    {
-        return std::env::var_os("HOME")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(std::env::temp_dir)
-            .join("Library/Application Support/Resource Monitor/settings.conf");
-    }
-    #[cfg(target_os = "windows")]
-    {
-        return std::env::var_os("APPDATA")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(std::env::temp_dir)
-            .join("Resource Monitor/settings.conf");
-    }
-    #[allow(unreachable_code)]
-    std::env::var_os("XDG_CONFIG_HOME")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| {
-            std::env::var_os("HOME")
-                .map(std::path::PathBuf::from)
-                .unwrap_or_else(std::env::temp_dir)
-                .join(".config")
-        })
-        .join("resource-monitor/settings.conf")
-}
-
-fn save_settings(value: &str) -> Result<(), String> {
-    let path = settings_file();
-    let parent = path
-        .parent()
-        .ok_or_else(|| "설정 파일 경로를 만들 수 없습니다.".to_owned())?;
-    std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
-    std::fs::write(path, value).map_err(|error| error.to_string())
-}
-
-fn start_update_check(ctx: egui::Context) -> Receiver<Option<UpdateInfo>> {
-    let (sender, receiver) = mpsc::channel();
-    std::thread::spawn(move || {
-        let update = fetch_latest_update().ok().flatten();
-        let _ = sender.send(update);
-        ctx.request_repaint();
-    });
-    receiver
-}
-
-fn fetch_latest_update() -> Result<Option<UpdateInfo>, String> {
-    let agent: ureq::Agent = ureq::Agent::config_builder()
-        .timeout_global(Some(Duration::from_secs(8)))
-        .build()
-        .into();
-    let mut response = agent
-        .get(RELEASE_API)
-        .header("Accept", "application/vnd.github+json")
-        .header("X-GitHub-Api-Version", "2022-11-28")
-        .header(
-            "User-Agent",
-            concat!("ResourceMonitor/", env!("CARGO_PKG_VERSION")),
-        )
-        .call()
-        .map_err(|error| error.to_string())?;
-    let value: serde_json::Value = response
-        .body_mut()
-        .read_json()
-        .map_err(|error| error.to_string())?;
-    Ok(latest_update_from_json(&value))
-}
-
-fn latest_update_from_json(value: &serde_json::Value) -> Option<UpdateInfo> {
-    let tag = value.get("tag_name")?.as_str()?;
-    let version_text = tag.strip_prefix('v').unwrap_or(tag);
-    let latest = semver::Version::parse(version_text).ok()?;
-    let current = semver::Version::parse(env!("CARGO_PKG_VERSION")).ok()?;
-    if latest <= current {
-        return None;
-    }
-    let url = value.get("html_url")?.as_str()?;
-    if !url.starts_with("https://github.com/Mobil0010/resource_monitor/releases/tag/") {
-        return None;
-    }
-    let suffix = if cfg!(target_os = "macos") {
-        "-macOS-Universal.dmg"
-    } else if cfg!(target_os = "windows") {
-        "-Windows-Setup.exe"
-    } else {
-        return None;
-    };
-    let asset = value.get("assets")?.as_array()?.iter().find(|asset| {
-        asset
-            .get("name")
-            .and_then(|name| name.as_str())
-            .is_some_and(|name| name.starts_with("ResourceMonitor-") && name.ends_with(suffix))
-    })?;
-    let asset_name = asset.get("name")?.as_str()?;
-    let asset_url = asset.get("browser_download_url")?.as_str()?;
-    if !asset_url.starts_with("https://github.com/Mobil0010/resource_monitor/releases/download/")
-        || asset_name.contains(['/', '\\'])
-    {
-        return None;
-    }
-    Some(UpdateInfo {
-        version: format!("v{latest}"),
-        asset_url: asset_url.to_owned(),
-        asset_name: asset_name.to_owned(),
-    })
-}
-
-fn start_update_download(
-    update: UpdateInfo,
-    ctx: egui::Context,
-) -> Receiver<Result<std::path::PathBuf, String>> {
-    let (sender, receiver) = mpsc::channel();
-    std::thread::spawn(move || {
-        let result = download_update(&update);
-        let _ = sender.send(result);
-        ctx.request_repaint();
-    });
-    receiver
-}
-
-fn download_update(update: &UpdateInfo) -> Result<std::path::PathBuf, String> {
-    let directory = std::env::temp_dir().join("ResourceMonitorUpdate");
-    std::fs::create_dir_all(&directory).map_err(|error| error.to_string())?;
-    let path = directory.join(&update.asset_name);
-    let partial = directory.join(format!("{}.part", update.asset_name));
-    let agent: ureq::Agent = ureq::Agent::config_builder()
-        .timeout_global(Some(Duration::from_secs(300)))
-        .build()
-        .into();
-    let mut response = agent
-        .get(&update.asset_url)
-        .header(
-            "User-Agent",
-            concat!("ResourceMonitor/", env!("CARGO_PKG_VERSION")),
-        )
-        .call()
-        .map_err(|error| error.to_string())?;
-    let mut file = std::fs::File::create(&partial).map_err(|error| error.to_string())?;
-    std::io::copy(&mut response.body_mut().as_reader(), &mut file)
-        .map_err(|error| error.to_string())?;
-    std::fs::rename(&partial, &path).map_err(|error| error.to_string())?;
-    Ok(path)
-}
-
-fn launch_update(path: &std::path::Path) -> Result<(), String> {
-    #[cfg(target_os = "macos")]
-    let result = Command::new("open").arg(path).spawn();
-    #[cfg(target_os = "windows")]
-    let result = {
-        use std::os::windows::process::CommandExt;
-        let installer = path.to_string_lossy().replace('\'', "''");
-        let command = format!(
-            "$installer='{installer}'; Wait-Process -Id {} -ErrorAction SilentlyContinue; Start-Process -FilePath $installer",
-            std::process::id()
-        );
-        Command::new("C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe")
-            .args([
-                "-NoProfile",
-                "-NonInteractive",
-                "-ExecutionPolicy",
-                "Bypass",
-                "-WindowStyle",
-                "Hidden",
-                "-Command",
-            ])
-            .arg(command)
-            .creation_flags(0x08000000)
-            .spawn()
-    };
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-    let result: std::io::Result<std::process::Child> = Err(std::io::Error::new(
-        std::io::ErrorKind::Unsupported,
-        "unsupported platform",
-    ));
-    result.map(|_| ()).map_err(|error| error.to_string())
 }
 
 #[cfg(test)]
@@ -2749,51 +2985,31 @@ mod settings_tests {
     }
 
     #[test]
-    fn newer_github_release_is_detected() {
-        let suffix = if cfg!(target_os = "macos") {
-            "-macOS-Universal.dmg"
-        } else {
-            "-Windows-Setup.exe"
+    fn steam_settings_round_trip_keeps_profiles_and_selection() {
+        let profile = PopupProfile {
+            position: PopupPosition::BottomRight,
+            monitor: 2,
+            size: PopupSize::Small,
+            shown: [true, true, false, false, false, true],
+            opacity: 0.35,
+            graphs: false,
+            refresh_secs: 1,
         };
-        let asset_name = format!("ResourceMonitor-99.2.1{suffix}");
-        let value = serde_json::json!({
-            "tag_name": "v99.2.1",
-            "html_url": "https://github.com/Mobil0010/resource_monitor/releases/tag/v99.2.1",
-            "assets": [{
-                "name": asset_name,
-                "browser_download_url": format!("https://github.com/Mobil0010/resource_monitor/releases/download/v99.2.1/{asset_name}")
-            }]
-        });
-        assert_eq!(
-            latest_update_from_json(&value),
-            Some(UpdateInfo {
-                version: "v99.2.1".into(),
-                asset_url: format!(
-                    "https://github.com/Mobil0010/resource_monitor/releases/download/v99.2.1/{asset_name}"
-                ),
-                asset_name,
-            })
-        );
-    }
-
-    #[test]
-    fn old_invalid_or_untrusted_releases_are_ignored() {
-        for value in [
-            serde_json::json!({
-                "tag_name": env!("CARGO_PKG_VERSION"),
-                "html_url": "https://github.com/Mobil0010/resource_monitor/releases/tag/current"
-            }),
-            serde_json::json!({
-                "tag_name": "not-a-version",
-                "html_url": "https://github.com/Mobil0010/resource_monitor/releases/tag/test"
-            }),
-            serde_json::json!({
-                "tag_name": "v99.0.0",
-                "html_url": "https://example.com/download"
-            }),
-        ] {
-            assert_eq!(latest_update_from_json(&value), None);
-        }
+        let mut expected = SteamSettings::new(profile.clone());
+        expected.enabled = true;
+        expected.selection_mode = SteamSelectionMode::Selected;
+        expected.selected_games.insert(570);
+        expected.game_profiles.insert(570, profile);
+        expected.show_fps = true;
+        expected.include_other = true;
+        let encoded = encode_steam_settings(&expected).unwrap();
+        let actual: SteamSettings = serde_json::from_str(&encoded).unwrap();
+        assert!(actual.enabled);
+        assert_eq!(actual.selection_mode, SteamSelectionMode::Selected);
+        assert!(actual.selected_games.contains(&570));
+        assert!(actual.game_profiles.contains_key(&570));
+        assert!(actual.show_fps);
+        assert!(actual.include_other);
     }
 }
 
@@ -3004,6 +3220,479 @@ fn navigation_button(
     response
 }
 
+fn pick_path(folder: bool, ctx: egui::Context) -> Receiver<Option<PathBuf>> {
+    let (sender, receiver) = mpsc::channel();
+    std::thread::spawn(move || {
+        #[cfg(target_os = "windows")]
+        let result = {
+            use std::os::windows::process::CommandExt;
+            let script = if folder {
+                "Add-Type -AssemblyName System.Windows.Forms; $d=New-Object System.Windows.Forms.FolderBrowserDialog; $d.Description='Steam 라이브러리 폴더를 선택하세요'; if($d.ShowDialog() -eq 'OK'){[Console]::OutputEncoding=[Text.Encoding]::UTF8;Write-Output $d.SelectedPath}"
+            } else {
+                "Add-Type -AssemblyName System.Windows.Forms; $d=New-Object System.Windows.Forms.OpenFileDialog; $d.Filter='실행 파일 (*.exe)|*.exe'; if($d.ShowDialog() -eq 'OK'){[Console]::OutputEncoding=[Text.Encoding]::UTF8;Write-Output $d.FileName}"
+            };
+            Command::new("powershell.exe")
+                .args(["-NoProfile", "-STA", "-Command", script])
+                .creation_flags(0x08000000)
+                .output()
+                .ok()
+                .and_then(|output| {
+                    let text = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+                    (!text.is_empty()).then(|| PathBuf::from(text))
+                })
+        };
+        #[cfg(target_os = "macos")]
+        let result = {
+            let script = if folder {
+                "POSIX path of (choose folder with prompt \"Choose a Steam library\")"
+            } else {
+                "POSIX path of (choose file with prompt \"Choose a game executable\")"
+            };
+            Command::new("osascript")
+                .args(["-e", script])
+                .output()
+                .ok()
+                .and_then(|output| {
+                    let text = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+                    (!text.is_empty()).then(|| PathBuf::from(text))
+                })
+        };
+        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+        let result = None;
+        let _ = sender.send(result);
+        ctx.request_repaint();
+    });
+    receiver
+}
+
+fn default_steam_roots() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        if let Ok(output) = Command::new("reg")
+            .args(["query", r"HKCU\Software\Valve\Steam", "/v", "SteamPath"])
+            .creation_flags(0x08000000)
+            .output()
+        {
+            let value = String::from_utf8_lossy(&output.stdout);
+            if let Some(line) = value.lines().find(|line| line.contains("SteamPath"))
+                && let Some(path) = line.split("REG_SZ").nth(1)
+            {
+                roots.push(PathBuf::from(path.trim()));
+            }
+        }
+        if let Some(program_files) = std::env::var_os("ProgramFiles(x86)") {
+            roots.push(PathBuf::from(program_files).join("Steam"));
+        }
+        if let Some(program_files) = std::env::var_os("ProgramFiles") {
+            roots.push(PathBuf::from(program_files).join("Steam"));
+        }
+    }
+    #[cfg(target_os = "macos")]
+    if let Some(home) = std::env::var_os("HOME") {
+        roots.push(PathBuf::from(home).join("Library/Application Support/Steam"));
+    }
+    #[cfg(target_os = "linux")]
+    if let Some(home) = std::env::var_os("HOME") {
+        roots.push(PathBuf::from(&home).join(".steam/steam"));
+        roots.push(PathBuf::from(home).join(".local/share/Steam"));
+    }
+    roots.retain(|path| path.exists());
+    roots.sort();
+    roots.dedup();
+    roots
+}
+
+fn is_default_steam_library(path: &Path) -> bool {
+    default_steam_roots()
+        .into_iter()
+        .any(|root| path.starts_with(root))
+}
+
+fn normalize_library_root(path: &Path) -> PathBuf {
+    if path
+        .file_name()
+        .is_some_and(|name| name.eq_ignore_ascii_case("steamapps"))
+    {
+        path.parent().unwrap_or(path).to_path_buf()
+    } else {
+        path.to_path_buf()
+    }
+}
+
+fn validate_steam_library(path: &Path) -> bool {
+    normalize_library_root(path).join("steamapps").is_dir()
+}
+
+fn discover_libraries(manual: &[PathBuf]) -> Vec<PathBuf> {
+    let mut libraries: Vec<_> = manual
+        .iter()
+        .map(|path| normalize_library_root(path))
+        .collect();
+    for root in default_steam_roots() {
+        libraries.push(root.clone());
+        if let Ok(value) = std::fs::read_to_string(root.join("steamapps/libraryfolders.vdf")) {
+            for line in value.lines() {
+                if line.contains("\"path\"") {
+                    let mut quoted = line.split('"').skip(1).step_by(2);
+                    if quoted.next().is_some()
+                        && let Some(path) = quoted.next()
+                    {
+                        libraries.push(normalize_library_root(Path::new(
+                            &path.replace(r"\\", r"\"),
+                        )));
+                    }
+                }
+            }
+        }
+    }
+    libraries.retain(|path| validate_steam_library(path));
+    libraries.sort();
+    libraries.dedup();
+    libraries
+}
+
+fn local_steam_icon(library: &Path, app_id: u32) -> Option<Vec<u8>> {
+    let downloaded = steam_icon_cache_dir().join(format!("{app_id}.jpg"));
+    if let Ok(bytes) = std::fs::read(downloaded) {
+        return Some(bytes);
+    }
+    let roots = default_steam_roots();
+    for root in roots
+        .into_iter()
+        .chain(std::iter::once(library.to_path_buf()))
+    {
+        let cache = root.join("appcache/librarycache");
+        for candidate in [
+            cache.join(format!("{app_id}_icon.jpg")),
+            cache.join(format!("{app_id}_icon.png")),
+        ] {
+            if let Ok(bytes) = std::fs::read(candidate) {
+                return Some(bytes);
+            }
+        }
+        let nested = cache.join(app_id.to_string());
+        if let Ok(entries) = std::fs::read_dir(nested) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().is_some_and(|ext| {
+                    ext.eq_ignore_ascii_case("jpg") || ext.eq_ignore_ascii_case("png")
+                }) && let Ok(bytes) = std::fs::read(path)
+                {
+                    return Some(bytes);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn steam_icon_cache_dir() -> PathBuf {
+    settings_file()
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("steam-icons")
+}
+
+fn steam_metadata_cache_dir() -> PathBuf {
+    settings_file()
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("steam-metadata")
+}
+
+fn fetch_steam_kind(app_id: u32, name: &str) -> SteamItemKind {
+    let cache = steam_metadata_cache_dir().join(format!("{app_id}.type"));
+    if let Ok(value) = std::fs::read_to_string(&cache) {
+        return steam::kind_from_type(value.trim(), name);
+    }
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_global(Some(Duration::from_secs(4)))
+        .build()
+        .into();
+    let url =
+        format!("https://store.steampowered.com/api/appdetails?appids={app_id}&filters=basic");
+    let item_type = agent
+        .get(url)
+        .call()
+        .ok()
+        .and_then(|mut response| response.body_mut().read_json::<serde_json::Value>().ok())
+        .and_then(|value| {
+            value
+                .get(app_id.to_string())?
+                .get("data")?
+                .get("type")?
+                .as_str()
+                .map(str::to_owned)
+        });
+    if let Some(item_type) = item_type {
+        if let Some(parent) = cache.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::write(cache, &item_type);
+        steam::kind_from_type(&item_type, name)
+    } else {
+        steam::fallback_kind(name)
+    }
+}
+
+fn download_steam_icon(app_id: u32) -> Option<Vec<u8>> {
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_global(Some(Duration::from_secs(4)))
+        .build()
+        .into();
+    let url =
+        format!("https://cdn.cloudflare.steamstatic.com/steam/apps/{app_id}/capsule_sm_120.jpg");
+    let mut response = agent.get(url).call().ok()?;
+    if response.status() != 200 {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    response
+        .body_mut()
+        .as_reader()
+        .take(512 * 1024)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if image::load_from_memory(&bytes).is_err() {
+        return None;
+    }
+    let cache = steam_icon_cache_dir();
+    let _ = std::fs::create_dir_all(&cache);
+    let _ = std::fs::write(cache.join(format!("{app_id}.jpg")), &bytes);
+    Some(bytes)
+}
+
+fn scan_steam_libraries(
+    manual: Vec<PathBuf>,
+    language: Language,
+    ctx: egui::Context,
+) -> Receiver<SteamScanResult> {
+    let (sender, receiver) = mpsc::channel();
+    std::thread::spawn(move || {
+        let libraries = discover_libraries(&manual);
+        let mut games = Vec::new();
+        for library in &libraries {
+            let steamapps = library.join("steamapps");
+            let Ok(entries) = std::fs::read_dir(&steamapps) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let file_name = path
+                    .file_name()
+                    .and_then(|v| v.to_str())
+                    .unwrap_or_default();
+                if !file_name.starts_with("appmanifest_")
+                    || path.extension().and_then(|v| v.to_str()) != Some("acf")
+                {
+                    continue;
+                }
+                let Ok(value) = std::fs::read_to_string(&path) else {
+                    continue;
+                };
+                let Some(app_id) =
+                    steam::manifest_value(&value, "appid").and_then(|v| v.parse::<u32>().ok())
+                else {
+                    continue;
+                };
+                let Some(name) = steam::manifest_value(&value, "name") else {
+                    continue;
+                };
+                let Some(folder) = steam::manifest_value(&value, "installdir") else {
+                    continue;
+                };
+                let install_dir = steamapps.join("common").join(folder);
+                if !install_dir.is_dir() {
+                    continue;
+                }
+                let icon = local_steam_icon(library, app_id);
+                games.push(SteamGame {
+                    app_id,
+                    name,
+                    install_dir,
+                    icon,
+                    kind: SteamItemKind::Game,
+                });
+            }
+        }
+        if !games.is_empty() {
+            let chunk_size = games.len().div_ceil(6);
+            std::thread::scope(|scope| {
+                for chunk in games.chunks_mut(chunk_size) {
+                    scope.spawn(move || {
+                        for game in chunk.iter_mut().filter(|game| game.icon.is_none()) {
+                            game.icon = download_steam_icon(game.app_id);
+                        }
+                        for game in chunk.iter_mut() {
+                            game.kind = fetch_steam_kind(game.app_id, &game.name);
+                        }
+                    });
+                }
+            });
+        }
+        games.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+        games.dedup_by_key(|game| game.app_id);
+        let message = match language {
+            Language::Korean => format!(
+                "Steam 게임 {}개, 라이브러리 {}개를 찾았습니다.",
+                games.len(),
+                libraries.len()
+            ),
+            Language::Japanese => format!(
+                "Steamゲーム{}個、ライブラリ{}個が見つかりました。",
+                games.len(),
+                libraries.len()
+            ),
+            Language::English => format!(
+                "Found {} Steam games in {} libraries.",
+                games.len(),
+                libraries.len()
+            ),
+        };
+        let _ = sender.send(SteamScanResult {
+            games,
+            libraries,
+            message,
+        });
+        ctx.request_repaint();
+    });
+    receiver
+}
+
+fn steam_game_pid(game: &SteamGame, manual: Option<&Vec<PathBuf>>, system: &System) -> Option<u32> {
+    let install = steam::normalize_path(&game.install_dir);
+    system.processes().iter().find_map(|(pid, process)| {
+        let exe = process.exe().map(steam::normalize_path).unwrap_or_default();
+        (exe.starts_with(&(install.clone() + "\\"))
+            || manual
+                .is_some_and(|paths| paths.iter().any(|path| steam::normalize_path(path) == exe)))
+        .then(|| pid.as_u32())
+    })
+}
+
+fn popup_profile_editor(ui: &mut egui::Ui, profile: &mut PopupProfile, lang: Language, id: &str) {
+    card(ui, |ui| {
+        ui.label(RichText::new(tr(lang, "visible_items")).strong().size(15.0));
+        ui.label(
+            RichText::new(tr(lang, "steam_visible_description"))
+                .weak()
+                .size(11.0),
+        );
+        ui.add_space(8.0);
+        ui.columns(3, |c| {
+            c[0].checkbox(&mut profile.shown[0], tr(lang, "cpu_usage"));
+            c[1].checkbox(&mut profile.shown[1], tr(lang, "gpu_usage"));
+            c[2].checkbox(&mut profile.shown[2], tr(lang, "memory_usage"));
+        });
+        ui.columns(3, |c| {
+            c[0].checkbox(&mut profile.shown[3], tr(lang, "disk_usage"));
+            c[1].checkbox(&mut profile.shown[4], tr(lang, "process_count"));
+            c[2].checkbox(&mut profile.shown[5], tr(lang, "network_speed"));
+        });
+        ui.checkbox(&mut profile.graphs, tr(lang, "popup_graphs"));
+    });
+    ui.add_space(12.0);
+    card(ui, |ui| {
+        ui.label(
+            RichText::new(tr(lang, "screen_position"))
+                .strong()
+                .size(15.0),
+        );
+        ui.label(
+            RichText::new(tr(lang, "steam_position_description"))
+                .weak()
+                .size(11.0),
+        );
+        ui.add_space(8.0);
+        let monitors = monitor_areas(ui.ctx());
+        profile.monitor = profile.monitor.min(monitors.len().saturating_sub(1));
+        if monitors.len() > 1 {
+            egui::ComboBox::from_id_salt(format!("{id}_monitor"))
+                .selected_text(format!("{} {}", tr(lang, "monitor"), profile.monitor + 1))
+                .show_ui(ui, |ui| {
+                    for (index, monitor) in monitors.iter().enumerate() {
+                        ui.selectable_value(
+                            &mut profile.monitor,
+                            index,
+                            format!(
+                                "{} {} ({}×{})",
+                                tr(lang, "monitor"),
+                                index + 1,
+                                monitor.width as i32,
+                                monitor.height as i32
+                            ),
+                        );
+                    }
+                });
+        }
+        egui::Grid::new(format!("{id}_positions"))
+            .num_columns(3)
+            .spacing([18.0, 10.0])
+            .show(ui, |ui| {
+                for (index, position) in PopupPosition::ALL.into_iter().enumerate() {
+                    ui.radio_value(&mut profile.position, position, tr(lang, position.key()));
+                    if index % 3 == 2 {
+                        ui.end_row();
+                    }
+                }
+            });
+    });
+    ui.add_space(12.0);
+    card(ui, |ui| {
+        ui.label(RichText::new(tr(lang, "popup_size")).strong().size(15.0));
+        ui.label(
+            RichText::new(tr(lang, "steam_size_description"))
+                .weak()
+                .size(11.0),
+        );
+        ui.horizontal(|ui| {
+            for size in PopupSize::ALL {
+                ui.radio_value(&mut profile.size, size, tr(lang, size.key()));
+            }
+        });
+        ui.separator();
+        ui.label(RichText::new(tr(lang, "opacity")).strong().size(15.0));
+        ui.add(egui::Slider::new(&mut profile.opacity, 0.0..=1.0).show_value(true));
+        ui.separator();
+        ui.label(
+            RichText::new(tr(lang, "refresh_interval"))
+                .strong()
+                .size(15.0),
+        );
+        ui.label(
+            RichText::new(tr(lang, "steam_refresh_description"))
+                .weak()
+                .size(11.0),
+        );
+        ui.add(
+            egui::Slider::new(&mut profile.refresh_secs, 1..=10).suffix(tr(lang, "seconds_suffix")),
+        );
+    });
+}
+
+fn steam_icon_texture(
+    textures: &mut HashMap<u32, egui::TextureHandle>,
+    ctx: &egui::Context,
+    app_id: u32,
+    bytes: Option<&[u8]>,
+) -> Option<egui::TextureHandle> {
+    if let Some(texture) = textures.get(&app_id) {
+        return Some(texture.clone());
+    }
+    let image = image::load_from_memory(bytes?).ok()?.to_rgba8();
+    let size = [image.width() as usize, image.height() as usize];
+    let color = egui::ColorImage::from_rgba_unmultiplied(size, image.as_raw());
+    let texture = ctx.load_texture(
+        format!("steam_game_{app_id}"),
+        color,
+        egui::TextureOptions::LINEAR,
+    );
+    textures.insert(app_id, texture.clone());
+    Some(texture)
+}
+
 fn paint_navigation_icon(p: &egui::Painter, page: Page, c: egui::Pos2, color: Color32) {
     let stroke = Stroke::new(1.6, color);
     match page {
@@ -3076,6 +3765,24 @@ fn paint_navigation_icon(p: &egui::Painter, page: Page, c: egui::Pos2, color: Co
                 stroke,
             );
             p.line_segment([c + egui::vec2(3.0, 7.0), c + egui::vec2(6.0, 4.0)], stroke);
+        }
+        Page::GameIntegration => {
+            p.rect_stroke(
+                egui::Rect::from_center_size(c, Vec2::new(15.0, 9.0)),
+                4.0,
+                stroke,
+                StrokeKind::Inside,
+            );
+            p.line_segment(
+                [c + egui::vec2(-5.0, 0.0), c + egui::vec2(-1.0, 0.0)],
+                stroke,
+            );
+            p.line_segment(
+                [c + egui::vec2(-3.0, -2.0), c + egui::vec2(-3.0, 2.0)],
+                stroke,
+            );
+            p.circle_filled(c + egui::vec2(3.0, -1.5), 1.1, color);
+            p.circle_filled(c + egui::vec2(5.5, 1.0), 1.1, color);
         }
         Page::Settings => {
             p.circle_stroke(c, 5.0, stroke);
@@ -3399,6 +4106,134 @@ fn tr<'a>(lang: Language, key: &'a str) -> &'a str {
         (Language::Japanese, "network") => "ネットワーク",
         (Language::Korean, "settings") => "설정",
         (Language::Japanese, "settings") => "設定",
+        (Language::Korean, "game_integration") => "게임 연동",
+        (Language::Japanese, "game_integration") => "ゲーム連携",
+        (Language::Korean, "steam_link_title") => "로컬 Steam 라이브러리 연동",
+        (Language::Japanese, "steam_link_title") => "ローカルSteamライブラリ連携",
+        (Language::Korean, "steam_link_description") => {
+            "원할 때만 로컬 Steam 라이브러리를 연결합니다. 계정 비밀번호나 API 키는 필요하지 않습니다."
+        }
+        (Language::Japanese, "steam_link_description") => {
+            "必要な場合のみローカルSteamライブラリを連携します。アカウントのパスワードやAPIキーは不要です。"
+        }
+        (Language::Korean, "steam_auto_find") => "Steam 자동 검색 및 연동",
+        (Language::Japanese, "steam_auto_find") => "Steamを自動検索して連携",
+        (Language::Korean, "steam_manual_library") => "라이브러리 수동 지정",
+        (Language::Japanese, "steam_manual_library") => "ライブラリを手動指定",
+        (Language::Korean, "steam_rescan") => "게임 목록 다시 검색",
+        (Language::Japanese, "steam_rescan") => "ゲーム一覧を再検索",
+        (Language::Korean, "steam_disconnect") => "연동 끄기",
+        (Language::Japanese, "steam_disconnect") => "連携をオフ",
+        (Language::Korean, "steam_scanning") => {
+            "Steam 라이브러리와 설치된 게임을 검색하는 중입니다…"
+        }
+        (Language::Japanese, "steam_scanning") => {
+            "Steamライブラリとインストール済みゲームを検索しています…"
+        }
+        (Language::Korean, "steam_scan_failed") => "Steam 라이브러리를 검색하지 못했습니다.",
+        (Language::Japanese, "steam_scan_failed") => "Steamライブラリを検索できませんでした。",
+        (Language::Korean, "steam_invalid_library") => {
+            "선택한 폴더에서 steamapps 폴더를 찾지 못했습니다."
+        }
+        (Language::Japanese, "steam_invalid_library") => {
+            "選択したフォルダーにsteamappsがありません。"
+        }
+        (Language::Korean, "steam_trigger_title") => "팝업 실행 대상",
+        (Language::Japanese, "steam_trigger_title") => "ポップアップ対象",
+        (Language::Korean, "steam_trigger_description") => {
+            "모든 설치 게임 또는 직접 선택한 게임이 실행될 때만 게임용 팝업을 표시합니다."
+        }
+        (Language::Japanese, "steam_trigger_description") => {
+            "すべてのゲーム、または選択したゲームの実行中のみゲーム用ポップアップを表示します。"
+        }
+        (Language::Korean, "steam_all_games") => "모든 Steam 게임",
+        (Language::Japanese, "steam_all_games") => "すべてのSteamゲーム",
+        (Language::Korean, "steam_selected_games") => "선택한 게임만",
+        (Language::Japanese, "steam_selected_games") => "選択したゲームのみ",
+        (Language::Korean, "steam_include_other") => "기타 항목도 팝업 실행 대상에 포함",
+        (Language::Japanese, "steam_include_other") => "その他の項目もポップアップ対象に含める",
+        (Language::Korean, "steam_include_other_description") => {
+            "일반 프로그램, 전용 서버와 Steam 호환성 도구는 기본적으로 팝업을 실행하지 않습니다."
+        }
+        (Language::Japanese, "steam_include_other_description") => {
+            "一般アプリ、専用サーバー、Steam互換ツールは初期状態では対象外です。"
+        }
+        (Language::Korean, "steam_popup_title") => "Steam 게임 팝업",
+        (Language::Japanese, "steam_popup_title") => "Steamゲーム用ポップアップ",
+        (Language::Korean, "steam_popup_description") => {
+            "게임 중에는 일반 팝업을 숨기고 이 설정을 사용합니다. 게임 종료 후 일반 팝업 상태가 자동으로 복원됩니다."
+        }
+        (Language::Japanese, "steam_popup_description") => {
+            "ゲーム中は通常ポップアップを隠してこの設定を使い、終了後に通常状態へ戻します。"
+        }
+        (Language::Korean, "steam_custom_popup") => "일반 팝업과 다른 공통 게임 설정 사용",
+        (Language::Japanese, "steam_custom_popup") => "通常とは異なるゲーム共通設定を使用",
+        (Language::Korean, "steam_games_title") => "설치된 Steam 게임",
+        (Language::Japanese, "steam_games_title") => "インストール済みSteamゲーム",
+        (Language::Korean, "steam_games_group") => "게임 · DLC · 데모",
+        (Language::Japanese, "steam_games_group") => "ゲーム・DLC・デモ",
+        (Language::Korean, "steam_other_group") => "기타",
+        (Language::Japanese, "steam_other_group") => "その他",
+        (Language::Korean, "steam_games_description") => {
+            "목록은 로컬 manifest와 Steam 아이콘 캐시에서 읽습니다. 선택 모드에서는 체크한 게임만 감지합니다."
+        }
+        (Language::Japanese, "steam_games_description") => {
+            "ローカルmanifestとSteamアイコンキャッシュから一覧を読み込みます。"
+        }
+        (Language::Korean, "steam_no_games") => {
+            "검색된 게임이 없습니다. 자동 검색 또는 수동 지정을 실행해 주세요."
+        }
+        (Language::Japanese, "steam_no_games") => {
+            "ゲームが見つかりません。検索または手動指定を実行してください。"
+        }
+        (Language::Korean, "steam_use_game") => "대상",
+        (Language::Japanese, "steam_use_game") => "対象",
+        (Language::Korean, "steam_game_settings") => "게임별 설정",
+        (Language::Japanese, "steam_game_settings") => "ゲーム別設定",
+        (Language::Korean, "steam_game_settings_description") => {
+            "이 게임만 공통 설정과 다른 팝업을 사용하거나 감지용 실행 파일을 추가할 수 있습니다."
+        }
+        (Language::Japanese, "steam_game_settings_description") => {
+            "このゲーム専用のポップアップ設定や検出用実行ファイルを追加できます。"
+        }
+        (Language::Korean, "steam_game_custom_popup") => "이 게임에 전용 팝업 설정 사용",
+        (Language::Japanese, "steam_game_custom_popup") => "このゲーム専用設定を使用",
+        (Language::Korean, "steam_add_executable") => "감지용 실행 파일 추가",
+        (Language::Japanese, "steam_add_executable") => "検出用実行ファイルを追加",
+        (Language::Korean, "steam_manual_executables") => "직접 추가한 실행 파일",
+        (Language::Japanese, "steam_manual_executables") => "手動追加した実行ファイル",
+        (Language::Korean, "steam_visible_description") => {
+            "게임 중 팝업에 표시할 시스템 정보를 선택합니다."
+        }
+        (Language::Japanese, "steam_visible_description") => {
+            "ゲーム中に表示するシステム情報を選びます。"
+        }
+        (Language::Korean, "steam_position_description") => {
+            "게임 팝업을 표시할 모니터와 위치를 선택합니다."
+        }
+        (Language::Japanese, "steam_position_description") => "表示するモニターと位置を選びます。",
+        (Language::Korean, "steam_size_description") => {
+            "게임 화면에 맞는 팝업 크기와 배경 투명도를 선택합니다."
+        }
+        (Language::Japanese, "steam_size_description") => {
+            "ポップアップのサイズと背景透明度を選びます。"
+        }
+        (Language::Korean, "steam_refresh_description") => {
+            "게임 중 시스템 정보를 다시 측정하는 간격입니다."
+        }
+        (Language::Japanese, "steam_refresh_description") => {
+            "ゲーム中にシステム情報を更新する間隔です。"
+        }
+        (Language::Korean, "frame_time") => "프레임 시간",
+        (Language::Japanese, "frame_time") => "フレーム時間",
+        (Language::Korean, "presentmon_explanation") => {
+            "FPS와 프레임 시간은 Windows에서 PresentMon 측정 소스를 사용할 수 있을 때 표시됩니다."
+        }
+        (Language::Japanese, "presentmon_explanation") => {
+            "FPSとフレーム時間はWindowsでPresentMonが利用可能な場合に表示されます。"
+        }
+        (Language::Korean, "presentmon_required") => "측정 소스 필요",
+        (Language::Japanese, "presentmon_required") => "測定ソースが必要",
         (Language::Korean, "language") => "언어",
         (Language::Japanese, "language") => "言語",
         (Language::Korean, "popup_title") => "팝업 설정",
@@ -3563,6 +4398,59 @@ fn tr<'a>(lang: Language, key: &'a str) -> &'a str {
         (_, "processes") => "Processes",
         (_, "network") => "Network",
         (_, "settings") => "Settings",
+        (_, "game_integration") => "Game integration",
+        (_, "steam_link_title") => "Connect a local Steam library",
+        (_, "steam_link_description") => {
+            "Connect local Steam libraries only when you choose. No account password or API key is required."
+        }
+        (_, "steam_auto_find") => "Find and connect Steam",
+        (_, "steam_manual_library") => "Choose library manually",
+        (_, "steam_rescan") => "Rescan games",
+        (_, "steam_disconnect") => "Disable integration",
+        (_, "steam_scanning") => "Scanning Steam libraries and installed games…",
+        (_, "steam_scan_failed") => "Steam libraries could not be scanned.",
+        (_, "steam_invalid_library") => "The selected folder does not contain a steamapps folder.",
+        (_, "steam_trigger_title") => "Popup trigger",
+        (_, "steam_trigger_description") => {
+            "Show the gaming popup for every installed game or only selected games."
+        }
+        (_, "steam_all_games") => "All Steam games",
+        (_, "steam_selected_games") => "Selected games only",
+        (_, "steam_include_other") => "Include other items as popup triggers",
+        (_, "steam_include_other_description") => {
+            "Applications, dedicated servers, and Steam compatibility tools do not trigger the popup by default."
+        }
+        (_, "steam_popup_title") => "Steam gaming popup",
+        (_, "steam_popup_description") => {
+            "The normal popup is hidden while gaming and restored when the game exits."
+        }
+        (_, "steam_custom_popup") => "Use different shared gaming settings",
+        (_, "steam_games_title") => "Installed Steam games",
+        (_, "steam_games_group") => "Games · DLC · demos",
+        (_, "steam_other_group") => "Other",
+        (_, "steam_games_description") => {
+            "Games are read from local manifests and Steam's local icon cache."
+        }
+        (_, "steam_no_games") => "No games found. Run automatic discovery or choose a library.",
+        (_, "steam_use_game") => "Trigger",
+        (_, "steam_game_settings") => "Per-game settings",
+        (_, "steam_game_settings_description") => {
+            "Use a unique popup for this game or add an executable for reliable detection."
+        }
+        (_, "steam_game_custom_popup") => "Use a custom popup for this game",
+        (_, "steam_add_executable") => "Add detection executable",
+        (_, "steam_manual_executables") => "Manually added executables",
+        (_, "steam_visible_description") => "Choose the system information shown while gaming.",
+        (_, "steam_position_description") => {
+            "Choose the monitor and position for the gaming popup."
+        }
+        (_, "steam_size_description") => "Choose the popup size and background opacity for games.",
+        (_, "steam_refresh_description") => "How often system information is sampled while gaming.",
+        (_, "frame_time") => "Frame time",
+        (_, "presentmon_explanation") => {
+            "FPS and frame time are shown when a PresentMon measurement source is available on Windows."
+        }
+        (_, "presentmon_required") => "Capture source required",
         (_, "language") => "Language",
         (_, "popup_title") => "Popup settings",
         (_, "popup_description") => "Keep selected system information visible in a small window.",
@@ -3696,15 +4584,7 @@ fn acquire_single_instance() -> Option<SingleInstanceGuard> {
 
 #[cfg(target_os = "windows")]
 fn focus_existing_instance() {
-    const SW_RESTORE: i32 = 9;
-    let title: Vec<u16> = "Resource Monitor\0".encode_utf16().collect();
-    unsafe {
-        let window = FindWindowW(std::ptr::null(), title.as_ptr());
-        if !window.is_null() {
-            ShowWindow(window, SW_RESTORE);
-            SetForegroundWindow(window);
-        }
-    }
+    monitors::focus_main_window();
 }
 
 fn main() -> eframe::Result {
@@ -3816,7 +4696,7 @@ fn main() -> eframe::Result {
         && let Ok(mut pending) = update_on_exit.lock()
         && let Some(path) = pending.take()
     {
-        let _ = launch_update(&path);
+        let _ = updater::launch(&path);
     }
     result
 }

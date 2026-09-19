@@ -4,6 +4,9 @@
 #ifndef SourceExe
   #define SourceExe "..\..\target\x86_64-pc-windows-msvc\release\resource_monitor.exe"
 #endif
+#ifndef PresentMonDir
+  #define PresentMonDir "..\..\vendor\presentmon"
+#endif
 
 [Setup]
 AppId={{4C3601C9-C50B-48BA-959D-D9CE2B721D22}
@@ -44,6 +47,8 @@ Name: "desktopicon"; Description: "바탕 화면에 바로 가기 만들기"; Gr
 [Files]
 Source: "{#SourceExe}"; DestDir: "{app}"; DestName: "ResourceMonitor.exe"; Flags: ignoreversion
 Source: "..\..\vendor\sensor-support\*"; DestDir: "{app}\sensor-support"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "{#PresentMonDir}\PresentMon.exe"; DestDir: "{app}\tools"; DestName: "PresentMon.exe"; Flags: ignoreversion
+Source: "{#PresentMonDir}\LICENSE.txt"; DestDir: "{app}\tools"; DestName: "PresentMon-LICENSE.txt"; Flags: ignoreversion
 
 [Icons]
 Name: "{autoprograms}\Resource Monitor"; Filename: "{app}\ResourceMonitor.exe"; IconFilename: "{app}\ResourceMonitor.exe"
