@@ -15,6 +15,21 @@ pub(super) fn find() -> Option<PathBuf> {
     if let Some(paths) = std::env::var_os("PATH") {
         candidates.extend(std::env::split_paths(&paths).map(|path| path.join("PresentMon.exe")));
     }
+    #[cfg(target_os = "windows")]
+    for root in [
+        std::env::var_os("ProgramFiles"),
+        std::env::var_os("ProgramFiles(x86)"),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        candidates.push(
+            PathBuf::from(root)
+                .join("Resource Monitor")
+                .join("tools")
+                .join("PresentMon.exe"),
+        );
+    }
     candidates.into_iter().find(|path| path.is_file())
 }
 

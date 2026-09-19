@@ -2192,14 +2192,19 @@ impl App {
         let refresh_interval = Duration::from_secs(profile.refresh_secs);
         let show_fps = self.active_steam_game().is_some() && self.steam.show_fps;
         let show_frame_time = self.active_steam_game().is_some() && self.steam.show_frame_time;
+        let performance_placeholder = if presentmon::find().is_some() {
+            tr(self.language, "presentmon_waiting")
+        } else {
+            tr(self.language, "presentmon_required")
+        };
         let fps_text = self
             .steam_fps
             .map(|value| format!("{value:.0}"))
-            .unwrap_or_else(|| tr(self.language, "presentmon_required").to_owned());
+            .unwrap_or_else(|| performance_placeholder.to_owned());
         let frame_time_text = self
             .steam_frame_time
             .map(|value| format!("{value:.1} ms"))
-            .unwrap_or_else(|| tr(self.language, "presentmon_required").to_owned());
+            .unwrap_or_else(|| performance_placeholder.to_owned());
         ctx.show_viewport_deferred(
             egui::ViewportId::from_hash_of("monitor_popup"),
             builder,
@@ -4234,6 +4239,8 @@ fn tr<'a>(lang: Language, key: &'a str) -> &'a str {
         }
         (Language::Korean, "presentmon_required") => "측정 소스 필요",
         (Language::Japanese, "presentmon_required") => "測定ソースが必要",
+        (Language::Korean, "presentmon_waiting") => "측정 대기 중",
+        (Language::Japanese, "presentmon_waiting") => "測定待機中",
         (Language::Korean, "language") => "언어",
         (Language::Japanese, "language") => "言語",
         (Language::Korean, "popup_title") => "팝업 설정",
@@ -4451,6 +4458,7 @@ fn tr<'a>(lang: Language, key: &'a str) -> &'a str {
             "FPS and frame time are shown when a PresentMon measurement source is available on Windows."
         }
         (_, "presentmon_required") => "Capture source required",
+        (_, "presentmon_waiting") => "Waiting for samples",
         (_, "language") => "Language",
         (_, "popup_title") => "Popup settings",
         (_, "popup_description") => "Keep selected system information visible in a small window.",
