@@ -2920,17 +2920,27 @@ fn mini_chart(ui: &mut egui::Ui, label: &str, values: &VecDeque<f32>, color: Col
         Vec2::new(ui.available_width(), 46.0 * scale),
         Sense::hover(),
     );
+    let axis_inset = 3.0 * scale;
+    let plot = egui::Rect::from_min_max(
+        egui::pos2(r.rect.left() + axis_inset, r.rect.top()),
+        egui::pos2(r.rect.right(), r.rect.bottom() - axis_inset),
+    );
+    let axis_color = popup_text_color(ui);
+    let axis_outline = popup_outline_color(ui);
+    let x_axis = [plot.left_bottom(), plot.right_bottom()];
+    let y_axis = [plot.left_bottom(), plot.left_top()];
+    p.line_segment(x_axis, Stroke::new(3.0, axis_outline));
+    p.line_segment(y_axis, Stroke::new(3.0, axis_outline));
+    p.line_segment(x_axis, Stroke::new(1.0, axis_color));
+    p.line_segment(y_axis, Stroke::new(1.0, axis_color));
     if values.len() > 1 {
         let points: Vec<egui::Pos2> = values
             .iter()
             .enumerate()
             .map(|(i, v)| {
                 egui::pos2(
-                    egui::lerp(
-                        r.rect.left()..=r.rect.right(),
-                        i as f32 / (HISTORY - 1) as f32,
-                    ),
-                    egui::lerp(r.rect.bottom()..=r.rect.top(), (*v / 100.0).clamp(0.0, 1.0)),
+                    egui::lerp(plot.left()..=plot.right(), i as f32 / (HISTORY - 1) as f32),
+                    egui::lerp(plot.bottom()..=plot.top(), (*v / 100.0).clamp(0.0, 1.0)),
                 )
             })
             .collect();
